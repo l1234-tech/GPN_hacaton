@@ -61,6 +61,7 @@ def collect_text_items(
     table_bboxes: list[tuple[float, float, float, float]],
     image_bboxes: list[tuple[float, float, float, float]],
 ) -> list[PageItem]:
+    """Сбор текстовых элементов с улучшенной фильтрацией."""
     items: list[PageItem] = []
     page_dict = page.get_text("dict")
 
@@ -74,7 +75,7 @@ def collect_text_items(
             continue
         if is_rotated_text_block(block):
             continue
-        if is_probable_watermark(text):
+        if is_probable_watermark(text, block, page.rect):
             continue
         if is_margin_text_block(block, page.rect, repeated_margin_texts):
             continue
@@ -83,11 +84,29 @@ def collect_text_items(
         if overlaps(bbox, image_bboxes, IMAGE_OVERLAP_THRESHOLD):
             continue
 
-        heading = detect_heading_level(text, block)
+        # Улучшенное определение заголовков с учетом предыдущего блока
+        prev_block = None
+        if items:
+            # Находим предыдущий текстовый блок для контекста
+            for prev_item in reversed(items):
+                if prev_item.kind == "text":
+                    # Ищем соответствующий блок в page_dict
+                    for b in page_dict.get("blocks", []):
+                        if b.get("type") == 0 and tuple(b["bbox"]) == prev_item.bbox:
+                            prev_block = b
+                            break
+                    break
+
+        heading = detect_heading_level(text, block, prev_block)
         if heading:
-            text = f"{heading} {text}"
+            text = f"{heading[0]} {heading[1]}"
+        
         items.append(PageItem(kind="text", bbox=bbox, content=normalize_text_block(text)))
 
+    # Объединяем перекрывающиеся текстовые блоки
+    from .layout_utils import merge_overlapping_text_blocks
+    items = merge_overlapping_text_blocks(items)
+    
     return items
 
 

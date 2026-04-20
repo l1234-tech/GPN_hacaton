@@ -196,71 +196,259 @@ def is_margin_text_block(
     return False
 
 
-def detect_heading_level(text: str, block: dict) -> tuple[str, str] | None:
-    """Возвращает (префикс_заголовка, чистый_текст) или None."""
+def detect_heading_level(text: str, block: dict, prev_block: dict = None) -> tuple[str, str] | None:
+    """Улучшенное определение уровня заголовка с учетом контекста."""
     if not text or "\n" in text:
         return None
-    if len(text) > 140:
+    if len(text) > 150:  # Увеличен лимит для длинных заголовков
         return None
 
+    text_lower = text.lower().strip()
+    
+    # Исключения - не заголовки
+    if any(phrase in text_lower for phrase in [
+        'стр.', 'страница', 'page', 'рис.', 'табл.', 'table', 'figure'
+    ]):
+        return None
+    
     max_size = block_max_font_size(block)
-    if max_size >= 22:
+    font_flags = block.get('lines', [{}])[0].get('spans', [{}])[0].get('flags', 0)
+    is_bold = bool(font_flags & 16)  # Проверка на жирный шрифт
+    
+    # Анализ предыдущего блока для контекста
+    prev_size = block_max_font_size(prev_block) if prev_block else 0
+    
+    # Логика определения заголовков
+    if max_size >= 24 or (max_size >= 20 and is_bold):
         return ("#", text)
-    if max_size >= 17:
+    elif max_size >= 18 or (max_size >= 16 and is_bold and max_size > prev_size):
         return ("##", text)
-    if max_size >= 14 and len(text) <= 90:
+    elif (max_size >= 14 and len(text) <= 100 and 
+          (is_bold or max_size > prev_size + 2)):
         return ("###", text)
+    elif (max_size >= 12 and len(text) <= 80 and 
+          text[0].isupper() and not text.endswith('.')):
+        return ("####", text)
+    
     return None
 
 
+def is_probable_watermark(text: str, block: dict, page_rect: fitz.Rect) -> bool:
+    """Улучшенное определение водяных знаков."""
+    normalized = text.lower().strip()
+    
+    # Явные маркеры водяных знаков
+    watermark_markers = (
+        "draft", "черновик", "confidential", "sample", "proof", "watermark",
+        "копия", "copy", "internal", "restricted", "confidential", "do not distribute"
+    )
+    
+    if any(marker in normalized for marker in watermark_markers):
+        return True
+    
+    # Анализ позиции и размера
+    x0, y0, x1, y1 = block["bbox"]
+    font_size = block_max_font_size(block)
+    
+    # Водяные знаки часто в углах или по центру с маленьким шрифтом
+    in_corner = (
+        (x0 < 50 and y0 < 50) or  # Левый верхний
+        (x1 > page_rect.width - 50 and y0 < 50) or  # Правый верхний
+        (x0 < 50 and y1 > page_rect.height - 50) or  # Левый нижний
+        (x1 > page_rect.width - 50 and y1 > page_rect.height - 50)  # Правый нижний
+    )
+    
+    if in_corner and font_size < 12:
+        return True
+    
+    # Повторяющийся текст в верхней/нижней части
+    in_margin = y0 <= 60 or y1 >= page_rect.height - 60
+    if in_margin and font_size < 14 and len(normalized) < 50:
+        return True
+    
+    return False
+
+
+def is_margin_text_block(
+    block: dict,
+    page_rect: fitz.Rect,
+    repeated_margin_texts: set[str],
+    margin_threshold: float = 48,
+) -> bool:
+    """Улучшенное определение текста в полях."""
+    x0, y0, x1, y1 = block["bbox"]
+    font_size = block_max_font_size(block)
+    normalized = normalize_repeat_key(extract_block_text(block))
+
+    # Повторяющийся текст
+    if normalized in repeated_margin_texts:
+        return True
+    
+    # Позиционные критерии
+    in_vertical_margin = y0 <= margin_threshold or y1 >= page_rect.height - margin_threshold
+    in_horizontal_margin = x0 <= margin_threshold / 2 or x1 >= page_rect.width - margin_threshold / 2
+    
+    # Размер шрифта
+    small_font = font_size < 12
+    
+    # Короткий текст
+    short_text = len(normalized) < 30
+    
+    if in_vertical_margin and (small_font or short_text):
+        return True
+    
+    if in_horizontal_margin and small_font:
+        return True
+    
+    return False
+
+
 def page_is_mostly_raster(page: fitz.Page) -> bool:
+    """Определение, является ли страница преимущественно растровой."""
     blocks = page.get_text("dict").get("blocks", [])
     text_chars = 0
     image_area = 0.0
     page_area = page.rect.width * page.rect.height
 
     for block in blocks:
-        if block.get("type") == 0:
+        if block.get("type") == 0:  # Текстовый блок
             text_chars += len(extract_block_text(block))
-        elif block.get("type") == 1:
+        elif block.get("type") == 1:  # Изображение
             image_area += bbox_area(tuple(block["bbox"]))
+        elif block.get("type") == 2:  # Векторная графика (может содержать текст)
+            # Некоторые векторные объекты могут быть текстом
+            pass
 
-    if text_chars < 40 and image_area / max(page_area, 1.0) > 0.6:
-        return True
-    return False
+    # Если очень мало текста и много изображений - считаем растровой
+    text_ratio = text_chars / max(page_area, 1.0)
+    image_ratio = image_area / max(page_area, 1.0)
+    
+    return text_chars < 50 and image_ratio > 0.5
 
 
 def order_page_items(items: list[PageItem], page_width: float) -> list[PageItem]:
-    if len(items) < 4:
+    """Улучшенное упорядочивание элементов страницы."""
+    if len(items) < 2:
         return sorted(items, key=lambda item: (round(item.bbox[1], 1), round(item.bbox[0], 1)))
 
+    # Группировка по типам и позициям
     full_width: list[PageItem] = []
-    left: list[PageItem] = []
-    right: list[PageItem] = []
+    left_column: list[PageItem] = []
+    right_column: list[PageItem] = []
     center = page_width / 2
-
+    
+    # Анализ распределения элементов
+    left_positions = []
+    right_positions = []
+    
     for item in items:
-        x0, _, x1, _ = item.bbox
+        x0, y0, x1, y1 = item.bbox
         width = x1 - x0
-        if width > page_width * 0.72:
+        
+        if width > page_width * 0.75:  # Полноширинный элемент
             full_width.append(item)
-        elif x1 <= center + 18:
-            left.append(item)
-        elif x0 >= center - 18:
-            right.append(item)
-        else:
+        elif x1 <= center + 20:  # Левый столбец
+            left_column.append(item)
+            left_positions.append(x0)
+        elif x0 >= center - 20:  # Правый столбец
+            right_column.append(item)
+            right_positions.append(x0)
+        else:  # Неопределенная позиция
             full_width.append(item)
-
-    if len(left) < 2 or len(right) < 2:
+    
+    # Определение, есть ли реальные столбцы
+    has_columns = (
+        len(left_column) >= 2 and len(right_column) >= 2 and
+        len(left_positions) > 0 and len(right_positions) > 0 and
+        max(left_positions) - min(left_positions) < 50 and  # Консистентное выравнивание
+        max(right_positions) - min(right_positions) < 50
+    )
+    
+    if not has_columns:
+        # Одноколоночный layout
         return sorted(items, key=lambda item: (round(item.bbox[1], 1), round(item.bbox[0], 1)))
-
+    
+    # Многоколоночный layout
     full_width.sort(key=lambda item: (item.bbox[1], item.bbox[0]))
-    left.sort(key=lambda item: (item.bbox[1], item.bbox[0]))
-    right.sort(key=lambda item: (item.bbox[1], item.bbox[0]))
-
+    left_column.sort(key=lambda item: (item.bbox[1], item.bbox[0]))
+    right_column.sort(key=lambda item: (item.bbox[1], item.bbox[0]))
+    
     ordered: list[PageItem] = []
-    ordered.extend([item for item in full_width if item.bbox[1] < min(left[0].bbox[1], right[0].bbox[1])])
-    ordered.extend(left)
-    ordered.extend(right)
+    
+    # Полноширинные элементы в начале
+    ordered.extend([item for item in full_width if item.bbox[1] < min(
+        left_column[0].bbox[1] if left_column else float('inf'),
+        right_column[0].bbox[1] if right_column else float('inf')
+    )])
+    
+    # Чередуем левый и правый столбцы
+    left_idx = 0
+    right_idx = 0
+    
+    while left_idx < len(left_column) or right_idx < len(right_column):
+        # Добавляем из левого столбца
+        if left_idx < len(left_column):
+            ordered.append(left_column[left_idx])
+            left_idx += 1
+        
+        # Добавляем из правого столбца
+        if right_idx < len(right_column):
+            ordered.append(right_column[right_idx])
+            right_idx += 1
+    
+    # Оставшиеся полноширинные элементы
     ordered.extend([item for item in full_width if item not in ordered])
+    
     return ordered
+
+
+def merge_overlapping_text_blocks(items: list[PageItem]) -> list[PageItem]:
+    """Объединение перекрывающихся текстовых блоков."""
+    if not items:
+        return items
+    
+    merged = []
+    sorted_items = sorted(items, key=lambda item: (item.bbox[1], item.bbox[0]))
+    
+    current = sorted_items[0]
+    
+    for item in sorted_items[1:]:
+        if (item.kind == "text" and current.kind == "text" and 
+            _bboxes_overlap_significantly(current.bbox, item.bbox)):
+            # Объединяем блоки
+            current = PageItem(
+                kind="text",
+                bbox=_merge_bboxes(current.bbox, item.bbox),
+                content=current.content + "\n" + item.content
+            )
+        else:
+            merged.append(current)
+            current = item
+    
+    merged.append(current)
+    return merged
+
+
+def _bboxes_overlap_significantly(
+    bbox1: tuple[float, float, float, float], 
+    bbox2: tuple[float, float, float, float],
+    threshold: float = 0.3
+) -> bool:
+    """Проверка значительного перекрытия bbox."""
+    area1 = bbox_area(bbox1)
+    area2 = bbox_area(bbox2)
+    overlap = intersection_area(bbox1, bbox2)
+    
+    return (overlap / min(area1, area2)) > threshold
+
+
+def _merge_bboxes(
+    bbox1: tuple[float, float, float, float], 
+    bbox2: tuple[float, float, float, float]
+) -> tuple[float, float, float, float]:
+    """Объединение двух bbox."""
+    x0 = min(bbox1[0], bbox2[0])
+    y0 = min(bbox1[1], bbox2[1])
+    x1 = max(bbox1[2], bbox2[2])
+    y1 = max(bbox1[3], bbox2[3])
+    return (x0, y0, x1, y1)

@@ -1,101 +1,115 @@
-# baseline/image_utils.py
-from __future__ import annotations
-
-import io
-from pathlib import Path
-
+# image_utils.py
 import fitz
-from PIL import Image
+from pathlib import Path
+from typing import List, Dict
 
-from layout_utils import PageItem, overlaps
+from .layout_utils import PageItem
 
-
-MIN_IMAGE_SIDE = 80
-IMAGE_OVERLAP_THRESHOLD = 0.35
-MIN_IMAGE_SIZE_KB = 15  # минимальный размер файла в КБ
+MIN_IMAGE_DIMENSION = 50
 
 
-def save_image_bytes(raw_bytes: bytes, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with Image.open(io.BytesIO(raw_bytes)) as image:
-        image.convert("RGB").save(output_path, format="PNG")
+def _get_image_bboxes(page: fitz.Page) -> Dict[int, tuple[float, float, float, float]]:
+    result: Dict[int, tuple[float, float, float, float]] = {}
+    page_dict = page.get_text("dict")
+    for block in page_dict.get("blocks", []):
+        if block.get("type") != 1:
+            continue
+        image_xref = block.get("image")
+        if image_xref is not None:
+            result[image_xref] = tuple(block.get("bbox", (0.0, 0.0, page.rect.width, page.rect.height)))
+    return result
 
 
-def save_page_clip(page: fitz.Page, bbox: tuple[float, float, float, float], output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=fitz.Rect(bbox), alpha=False).save(output_path)
+def _save_image(pix: fitz.Pixmap, path: Path) -> None:
+    if pix.n - pix.alpha >= 4:
+        pix = fitz.Pixmap(fitz.csRGB, pix)
+    pix.save(str(path))
+
+
+def extract_all_images(page: fitz.Page, doc_id: str, img_counter: int, out_dir: Path) -> tuple[List[PageItem], int]:
+    """Извлекает все изображения и рендерит векторную графику."""
+    items: List[PageItem] = []
+    visited_xrefs = set()
+    xref_bboxes = _get_image_bboxes(page)
+
+    # 1. Растровые изображения
+    for img in page.get_images(full=True):
+        xref = img[0]
+        if xref in visited_xrefs:
+            continue
+        visited_xrefs.add(xref)
+
+        try:
+            pix = fitz.Pixmap(page.parent, xref)
+        except Exception:
+            continue
+
+        if pix.width < MIN_IMAGE_DIMENSION or pix.height < MIN_IMAGE_DIMENSION:
+            continue
+
+        fname = f"doc_{doc_id}_image_{img_counter}.png"
+        out_path = out_dir / fname
+        _save_image(pix, out_path)
+
+        bbox = xref_bboxes.get(xref, (0.0, 0.0, page.rect.width, page.rect.height))
+        items.append(PageItem(kind="image", bbox=bbox, content=f"![Image]({fname})"))
+        img_counter += 1
+
+    drawings = page.cluster_drawings()
+    for rect in drawings:
+        if rect.width < MIN_IMAGE_DIMENSION or rect.height < MIN_IMAGE_DIMENSION:
+            continue
+
+        fname = f"doc_{doc_id}_image_{img_counter}.png"
+        out_path = out_dir / fname
+        pix = page.get_pixmap(clip=rect, matrix=fitz.Matrix(2, 2))
+        if pix.width < MIN_IMAGE_DIMENSION or pix.height < MIN_IMAGE_DIMENSION:
+            continue
+
+        _save_image(pix, out_path)
+        bbox = (rect.x0, rect.y0, rect.x1, rect.y1)
+        items.append(PageItem(kind="image", bbox=bbox, content=f"![Image]({fname})"))
+        img_counter += 1
+
+    unique_items: List[PageItem] = []
+    seen_bboxes: List[tuple[float, float, float, float]] = []
+    for item in items:
+        if any(
+            abs(item.bbox[0] - other[0]) < 2
+            and abs(item.bbox[1] - other[1]) < 2
+            and abs(item.bbox[2] - other[2]) < 2
+            and abs(item.bbox[3] - other[3]) < 2
+            for other in seen_bboxes
+        ):
+            continue
+        seen_bboxes.append(item.bbox)
+        unique_items.append(item)
+
+    return unique_items, img_counter
 
 
 def extract_page_images(
     page: fitz.Page,
-    table_bboxes: list[tuple[float, float, float, float]],
+    table_bboxes: List[tuple[float, float, float, float]],
     output_images_dir: Path,
     doc_id: int,
     image_counter_start: int,
-    skip_large_background: bool,
-) -> tuple[list[PageItem], int, list[tuple[float, float, float, float]]]:
-    items: list[PageItem] = []
-    image_bboxes: list[tuple[float, float, float, float]] = []
-    image_counter = image_counter_start
-    page_area = page.rect.width * page.rect.height
-    page_dict = page.get_text("dict")
+    skip_large_background: bool = False,
+) -> tuple[List[PageItem], int, List[tuple[float, float, float, float]]]:
+    output_images_dir.mkdir(parents=True, exist_ok=True)
+    items, image_counter = extract_all_images(page, doc_id, image_counter_start, output_images_dir)
+    image_bboxes = [item.bbox for item in items]
 
-    for block in page_dict.get("blocks", []):
-        if block.get("type") != 1:
-            continue
-
-        bbox = tuple(block["bbox"])
-        x0, y0, x1, y1 = bbox
-        area_ratio = ((x1 - x0) * (y1 - y0)) / max(page_area, 1.0)
-        if (x1 - x0) < MIN_IMAGE_SIDE or (y1 - y0) < MIN_IMAGE_SIDE:
-            continue
-        if area_ratio > 0.45:
-            continue
-        if skip_large_background and area_ratio > 0.25:
-            continue
-        if overlaps(bbox, table_bboxes, IMAGE_OVERLAP_THRESHOLD):
-            continue
-
-        raw_bytes = block.get("image")
-        if not raw_bytes:
-            continue
-
-        # Фильтрация по размеру (водяные знаки обычно мелкие)
-        if len(raw_bytes) < MIN_IMAGE_SIZE_KB * 1024:
-            continue
-
-        image_counter += 1
-        filename = f"doc_{doc_id}_image_{image_counter}.png"
-        save_image_bytes(raw_bytes, output_images_dir / filename)
-        image_bboxes.append(bbox)
-        items.append(PageItem(kind="image", bbox=bbox, content=f"![Image](images/{filename})"))
-
-    for drawing_rect in page.cluster_drawings():
-        bbox = tuple(drawing_rect)
-        x0, y0, x1, y1 = bbox
-        area_ratio = ((x1 - x0) * (y1 - y0)) / max(page_area, 1.0)
-        if (x1 - x0) < 120 or (y1 - y0) < 120:
-            continue
-        if area_ratio > 0.45:
-            continue
-        if skip_large_background and area_ratio > 0.25:
-            continue
-        if overlaps(bbox, table_bboxes, IMAGE_OVERLAP_THRESHOLD):
-            continue
-        if overlaps(bbox, image_bboxes, IMAGE_OVERLAP_THRESHOLD):
-            continue
-
-        # Для drawing также проверяем размер после сохранения
-        image_counter += 1
-        filename = f"doc_{doc_id}_image_{image_counter}.png"
-        output_path = output_images_dir / filename
-        save_page_clip(page, bbox, output_path)
-        if output_path.stat().st_size < MIN_IMAGE_SIZE_KB * 1024:
-            output_path.unlink()
-            image_counter -= 1
-            continue
-
-        image_bboxes.append(bbox)
-        items.append(PageItem(kind="image", bbox=bbox, content=f"![Image](images/{filename})"))
+    if skip_large_background:
+        page_area = page.rect.width * page.rect.height
+        filtered: List[PageItem] = []
+        kept_bboxes: List[tuple[float, float, float, float]] = []
+        for item in items:
+            x0, y0, x1, y1 = item.bbox
+            if (x1 - x0) * (y1 - y0) >= page_area * 0.85:
+                continue
+            filtered.append(item)
+            kept_bboxes.append(item.bbox)
+        return filtered, image_counter, kept_bboxes
 
     return items, image_counter, image_bboxes

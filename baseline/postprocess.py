@@ -1,173 +1,251 @@
 # baseline/postprocess.py
-from __future__ import annotations
-
 import re
-
+from typing import List, Dict, Any
 
 def clean_cell_text(value: str | None) -> str:
+    """Очистка текста ячейки таблицы."""
     if value is None:
         return ""
-    value = value.replace("\xa0", " ").replace("\n", " ")
+    value = str(value).replace("\xa0", " ").replace("\n", " ").replace("\t", " ")
     value = re.sub(r"\s+", " ", value)
-    value = re.sub(r"\s+([,.;:!?%)\]])", r"\1", value)
     return value.strip()
 
-
-def fill_merged_header_cells(rows: list[list[str]]) -> list[list[str]]:
-    if not rows:
-        return rows
-    width = max(len(row) for row in rows)
-    normalized = [row + [""] * (width - len(row)) for row in rows]
-    for row in normalized:
-        last_seen = ""
-        for idx in range(len(row)):
-            if row[idx]:
-                last_seen = row[idx]
-            elif last_seen:
-                row[idx] = last_seen
-    for col in range(width):
-        last_seen = ""
-        for row in normalized:
-            if row[col]:
-                last_seen = row[col]
-            elif last_seen:
-                row[col] = last_seen
-    return normalized
-
-
-def infer_header_rows(rows: list[list[str]]) -> int:
-    if len(rows) <= 1:
-        return 1
-    header_rows = 1
-    for row in rows[:3]:
-        filled = [cell for cell in row if cell]
-        if not filled:
-            break
-        numeric_ratio = sum(bool(re.search(r"\d", cell)) for cell in filled) / max(1, len(filled))
-        if numeric_ratio <= 0.45:
-            header_rows += 1
-        else:
-            break
-    return min(header_rows, max(1, len(rows) - 1))
-
-
-def table_to_markdown(rows: list[list[str]]) -> str:
-    # Удаляем полностью пустые строки и столбцы
-    rows = [row for row in rows if any(cell.strip() for cell in row)]
-    if not rows:
+def table_to_markdown(rows: List[List[str]]) -> str:
+    """Конвертация таблицы в Markdown."""
+    if not rows or not any(any(cell.strip() for cell in row) for row in rows):
         return ""
-    # Транспонируем, удаляем пустые столбцы, возвращаем обратно
-    transposed = list(zip(*rows))
-    transposed = [list(col) for col in transposed if any(cell.strip() for cell in col)]
-    if not transposed:
+    
+    # Очистка строк
+    cleaned_rows = []
+    for row in rows:
+        cleaned_row = [clean_cell_text(cell) for cell in row]
+        if any(cleaned_row):
+            cleaned_rows.append(cleaned_row)
+    
+    if len(cleaned_rows) < 2:
         return ""
-    rows = [list(row) for row in zip(*transposed)]
-
-    cleaned = [[clean_cell_text(cell) for cell in row] for row in rows]
-    width = max(len(row) for row in cleaned)
-    cleaned = [row + [""] * (width - len(row)) for row in cleaned]
-
-    header_rows = infer_header_rows(cleaned)
-    if header_rows >= len(cleaned):
-        header_rows = max(1, len(cleaned) - 1)
-    header = fill_merged_header_cells(cleaned[:header_rows])
-    body = cleaned[header_rows:]
-
-    header_line = []
-    for col in range(width):
-        parts = []
-        for row in header:
-            if row[col]:
-                parts.append(row[col])
-        header_line.append("_".join(parts) if parts else f"col_{col+1}")
-
-    separator = ["---"] * width
+    
+    # Выравнивание колонок
+    max_cols = max(len(row) for row in cleaned_rows)
+    aligned_rows = [row + [""] * (max_cols - len(row)) for row in cleaned_rows]
+    
+    # Создание Markdown
+    header = aligned_rows[0]
+    body = aligned_rows[1:]
+    
     lines = [
-        "| " + " | ".join(header_line) + " |",
-        "| " + " | ".join(separator) + " |",
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join(["---"] * len(header)) + " |"
     ]
-    for row in body:
-        formatted_row = [cell if cell else " " for cell in row]
-        lines.append("| " + " | ".join(formatted_row) + " |")
+    lines.extend("| " + " | ".join(row) + " |" for row in body)
+    
     return "\n".join(lines)
 
+def normalize_markdown(text: str) -> str:
+    """Комплексная нормализация Markdown текста."""
+    if not text:
+        return ""
+    
+    # Разделение на строки
+    lines = text.split('\n')
+    normalized_lines = []
+    
+    for line in lines:
+        line = line.strip()
+        if not line:
+            continue
+        
+        # Обработка заголовков
+        if line.startswith('#'):
+            line = _normalize_header(line)
+        
+        # Обработка списков
+        elif re.match(r'^[-*+]\s', line):
+            line = _normalize_list_item(line)
+        
+        # Обработка таблиц (уже обработаны отдельно)
+        
+        # Общая очистка текста
+        else:
+            line = _normalize_text_line(line)
+        
+        normalized_lines.append(line)
+    
+    # Объединение параграфов
+    result = _merge_paragraphs(normalized_lines)
+    
+    # Финальная очистка
+    result = _final_cleanup(result)
+    
+    return result.strip() + "\n"
+
+def _normalize_header(line: str) -> str:
+    """Нормализация заголовков."""
+    # Убираем лишние # в начале
+    match = re.match(r'^(#{1,6})\s*(.+)$', line)
+    if match:
+        hashes, content = match.groups()
+        content = _normalize_text_line(content)
+        return f"{hashes} {content}"
+    return line
+
+def _normalize_list_item(line: str) -> str:
+    """Нормализация элементов списка."""
+    match = re.match(r'^([-*+])\s*(.+)$', line)
+    if match:
+        marker, content = match.groups()
+        content = _normalize_text_line(content)
+        return f"{marker} {content}"
+    return line
+
+def _normalize_text_line(line: str) -> str:
+    """Нормализация обычной текстовой строки."""
+    # Удаление водяных знаков
+    line = _remove_watermarks(line)
+    
+    # Исправление дефисного переноса
+    line = _fix_hyphenation(line)
+    
+    # Нормализация пробелов
+    line = _normalize_spaces(line)
+    
+    # Исправление пунктуации
+    line = _fix_punctuation(line)
+    
+    return line
+
+def _remove_watermarks(text: str) -> str:
+    """Удаление водяных знаков и повторяющегося текста."""
+    # Распространенные водяные знаки
+    watermark_patterns = [
+        r'\b(?:draft|черновик|confidential|sample|proof|watermark|копия)\b',
+        r'\bстр\.\s*\d+\b',
+        r'\bстраница\s*\d+\b',
+        r'\bpage\s*\d+\b',
+        r'\b\d{1,2}[./-]\d{1,2}[./-]\d{2,4}\b',  # Даты
+        r'\[\s*\d+\s*\]',  # Ссылки типа [1]
+        r'\b\d{4}-\d{2}-\d{2}\b',  # Даты ISO
+    ]
+    
+    for pattern in watermark_patterns:
+        text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+    
+    return text
+
+def _fix_hyphenation(text: str) -> str:
+    """Исправление дефисного переноса слов."""
+    # Паттерн: слово- + перенос строки + продолжение
+    text = re.sub(r'(\w)-\s*\n\s*(\w)', r'\1\2', text)
+    
+    # Паттерн: слово в конце строки с дефисом
+    text = re.sub(r'(\w)-\s*$', r'\1', text, flags=re.MULTILINE)
+    
+    return text
+
+def _normalize_spaces(text: str) -> str:
+    """Нормализация пробелов и отступов."""
+    # Замена неразрывных пробелов
+    text = text.replace('\xa0', ' ')
+    
+    # Удаление лишних пробелов
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Удаление пробелов в начале и конце
+    text = text.strip()
+    
+    return text
+
+def _fix_punctuation(text: str) -> str:
+    """Исправление пунктуации."""
+    # Пробел перед знаками препинания
+    text = re.sub(r'\s+([,.;:!?])', r'\1', text)
+    
+    # Пробел после открывающих скобок
+    text = re.sub(r'([(\[])\s+', r'\1', text)
+    
+    # Пробел перед закрывающими скобками
+    text = re.sub(r'\s+([)\]])', r'\1', text)
+    
+    return text
+
+def _merge_paragraphs(lines: List[str]) -> str:
+    """Объединение коротких строк в параграфы."""
+    if not lines:
+        return ""
+    
+    merged = [lines[0]]
+    for line in lines[1:]:
+        # Если предыдущая строка не заголовок/список и текущая короткая - объединяем
+        if (not re.match(r'^(#|[-*+])', merged[-1]) and 
+            not re.match(r'^(#|[-*+])', line) and
+            len(line) < 80):
+            merged[-1] += " " + line
+        else:
+            merged.append(line)
+    
+    return "\n\n".join(merged)
+
+def _final_cleanup(text: str) -> str:
+    """Финальная очистка текста."""
+    # Удаление пустых строк в начале и конце
+    text = text.strip()
+    
+    # Замена множественных переносов строк
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    
+    # Удаление пробелов в конце строк
+    lines = [line.rstrip() for line in text.split('\n')]
+    text = '\n'.join(lines)
+    
+    return text
 
 def normalize_text_block(text: str) -> str:
-    text = text.replace("\xa0", " ")
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"(\w)-\s+(\w)", r"\1\2", text)
-    text = re.sub(r"\s+([,.;:!?%)\]])", r"\1", text)
-    text = re.sub(r"([(\[])\s+", r"\1", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    return text.strip()
+    """Нормализация блока текста с учетом контекста."""
+    if not text:
+        return ""
+    
+    # Разбиение на предложения
+    sentences = _split_into_sentences(text)
+    
+    # Нормализация каждого предложения
+    normalized_sentences = []
+    for sentence in sentences:
+        normalized = _normalize_text_line(sentence)
+        if normalized:
+            normalized_sentences.append(normalized)
+    
+    # Объединение предложений
+    result = " ".join(normalized_sentences)
+    
+    # Финальная обработка
+    result = _final_cleanup(result)
+    
+    return result
 
+def _split_into_sentences(text: str) -> List[str]:
+    """Разбиение текста на предложения."""
+    # Простое разбиение по точкам, восклицательным и вопросительным знакам
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    return [s.strip() for s in sentences if s.strip()]
 
-def normalize_markdown(text: str) -> str:
-    text = text.replace("\r\n", "\n")
-    # Удаление строк с водяными знаками (на всякий случай)
-    watermark_keywords = ["ЧЕРНОВИК", "DRAFT", "CONFIDENTIAL", "SAMPLE", "ОБРАЗЕЦ",
-                          "КОНФИДЕНЦИАЛЬНО", "НЕ ДЛЯ РАСПРОСТРАНЕНИЯ"]
-    lines = text.split("\n")
-    cleaned_lines = []
+def postprocess_table_markdown(markdown: str) -> str:
+    """Постобработка Markdown таблиц."""
+    if not markdown:
+        return ""
+    
+    lines = markdown.split('\n')
+    processed_lines = []
+    
     for line in lines:
-        upper = line.upper()
-        if any(kw in upper for kw in watermark_keywords):
-            continue
-        cleaned_lines.append(line)
-    text = "\n".join(cleaned_lines)
-
-    text = re.sub(r"[ \t]+\n", "\n", text)
-    text = re.sub(r"\n{3,}", "\n\n", text)
-    text = text.replace("\\", "/")
-    text = re.sub(r"(?<!\n)(#{1,6}\s)", r"\n\n\1", text)
-    text = re.sub(r"(?<!\n)(\|)", r"\n\n\1", text)
-    text = re.sub(r"(?<!\n)(!\[Image\]\(images/)", r"\n\n\1", text)
-    return text.strip() + "\n"
-
-
-def merge_split_tables_in_markdown(text: str) -> str:
-    """Склеивает соседние таблицы с одинаковым числом столбцов."""
-    lines = text.split('\n')
-    new_lines = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-        if stripped.startswith('|') and stripped.endswith('|') and '---' not in stripped:
-            start = i
-            while i < len(lines) and lines[i].strip() != '':
-                i += 1
-            end = i
-            current = lines[start:end]
-            # Смотрим следующую непустую строку
-            k = end + 1
-            while k < len(lines) and lines[k].strip() == '':
-                k += 1
-            if k < len(lines) and lines[k].strip().startswith('|'):
-                m = k
-                while m < len(lines) and lines[m].strip() != '':
-                    m += 1
-                next_tbl = lines[k:m]
-                # Проверяем число столбцов
-                sep_curr = next((ln for ln in current if '---' in ln), None)
-                sep_next = next((ln for ln in next_tbl if '---' in ln), None)
-                if sep_curr and sep_next:
-                    if sep_curr.count('|') == sep_next.count('|'):
-                        # Склеиваем: убираем заголовок второй таблицы
-                        sep_idx = next((idx for idx, ln in enumerate(next_tbl) if '---' in ln), None)
-                        if sep_idx is not None:
-                            body = next_tbl[sep_idx+1:]
-                            new_lines.extend(current + body)
-                            i = m
-                            if m < len(lines) and lines[m].strip() == '':
-                                new_lines.append(lines[m])
-                                i = m + 1
-                            continue
-            new_lines.extend(current)
-            if end < len(lines):
-                new_lines.append(lines[end])
-            i = end + 1
+        # Очистка ячеек от лишних пробелов
+        if '|' in line:
+            cells = [cell.strip() for cell in line.split('|')]
+            # Удаление пустых ячеек в конце
+            while cells and not cells[-1].strip():
+                cells.pop()
+            if cells:
+                processed_lines.append('|'.join(cells))
         else:
-            new_lines.append(line)
-            i += 1
-    return '\n'.join(new_lines)
+            processed_lines.append(line)
+    
+    return '\n'.join(processed_lines)
