@@ -140,25 +140,40 @@ def _clean_table_data(table_data: List[List[str]]) -> List[List[str]]:
 
 def _is_garbage_cell(text: str) -> bool:
     """Проверка, является ли содержимое ячейки мусором."""
-    if not text or len(text) < 2:
+    if not text or len(text) < 1:
         return False  # Пустые ячейки нормальны
     
-    # Очень длинный текст в ячейке
-    if len(text) > 300:
+    # Очень длинный текст в ячейке - вероятно это не ячейка
+    if len(text) > 500:
         return True
     
-    # Только цифры и базовые спецсимволы - обычно нормально
-    if re.match(r'^[0-9\s\-\.\,°²³\*\+\=\:\;\|\/\(\)]+$', text):
+    # Проверка на нечитаемые символы (кракозябры, артефакты OCR)
+    # Считаем долю "плохих" символов
+    bad_char_patterns = [
+        r'[^\x00-\x7F\u0400-\u04FF\u00C0-\u00FFa-zA-Z0-9\s\-\.\,\;\:\!\?\(\)\[\]\"\'\/\\@#\$\%\&\*\+\=\<\>\_\|\{\}\~\°²³]',
+    ]
+    
+    bad_chars = []
+    for char in text:
+        is_bad = False
+        for pattern in bad_char_patterns:
+            if re.match(pattern, char):
+                is_bad = True
+                break
+        if is_bad:
+            bad_chars.append(char)
+    
+    # Если много плохих символов - это мусор
+    if len(bad_chars) / len(text) > 0.3:
+        return True
+    
+    # Только цифры и базовые спецсимволы - обычно нормально (цены, даты, числа)
+    if re.match(r'^[0-9\s\-\.\,°²³\*\+\=\\:\\;\\|\\/\\(\\)\\%\\$\\₽\\rub]+$', text):
         return False
     
-    # Много странных спецсимволов
-    special_count = sum(1 for c in text if not c.isalnum() and c not in ' -.,;:()%')
-    if special_count / len(text) > 0.4:
-        return True
-    
-    # Почти всё спецсимволы
+    # Почти всё спецсимволы без букв
     alnum_count = sum(1 for c in text if c.isalnum())
-    if alnum_count / len(text) < 0.15:
+    if len(text) > 3 and alnum_count / len(text) < 0.1:
         return True
     
     return False
