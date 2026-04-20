@@ -46,6 +46,14 @@ def extract_tables_with_bbox(page: pdfplumber.page.Page) -> List[ParsedTable]:
                     markdown=md,
                     is_borderless=False
                 ))
+    
+    # Дополнительно ищем таблицы без границ
+    borderless = detect_borderless_tables(page)
+    for bt in borderless:
+        # Проверяем, не пересекается ли с уже найденными
+        if not any(t.overlaps_with_bbox(bt.bbox, 0.5) for t in tables):
+            tables.append(bt)
+    
     return tables
 
 def detect_borderless_tables(page: pdfplumber.page.Page, vertical_threshold=30.0, horizontal_threshold=10.0) -> List[ParsedTable]:
