@@ -1,111 +1,109 @@
-from __future__ import annotations
+#!/usr/bin/env python3
+"""
+Оценка качества парсинга PDF в Markdown.
+Сравнивает предсказанные файлы из results/ с эталонными из ground_truth/.
+"""
 
 import argparse
 import re
 from pathlib import Path
-from typing import Dict
-from collections import Counter
+import Levenshtein
 
-def analyze_md_file(md_path: Path) -> Dict:
-    """Анализ одного MD файла."""
-    try:
-        content = md_path.read_text(encoding="utf-8")
-    except Exception as e:
-        return {"filename": md_path.name, "error": str(e)}
 
-    lines = content.split('\n')
-    
-    stats = {
-        "filename": md_path.name,
-        "size_kb": len(content.encode("utf-8")) / 1024,
-        "char_count": len(content),
-    }
+def text_score(pred: str, gt: str) -> float:
+    if not pred and not gt:
+        return 1.0
+    return 1 - Levenshtein.distance(pred, gt) / max(len(pred), len(gt), 1)
 
-    # Заголовки
-    headers = re.findall(r'^(#{1,6})\s+(.+)$', content, re.MULTILINE)
-    stats["headers_count"] = len(headers)
-    
-    # Таблицы (упрощенно)
-    table_count = len(re.findall(r'\|[\s\-:|]+\|', content))
-    stats["tables_count"] = table_count
 
-    # Изображения
-    img_links = re.findall(r'!\[.*?\]\((.*?)\)', content)
-    stats["images_linked"] = len(img_links)
-    
-    existing_imgs = 0
-    missing_imgs = 0
-    for link in img_links:
-        clean_link = link.split('#')[0].strip()
-        if not clean_link: continue
-        img_path = md_path.parent / clean_link
-        if img_path.exists():
-            existing_imgs += 1
-        else:
-            missing_imgs += 1
-            
-    stats["images_existing"] = existing_imgs
-    stats["images_missing"] = missing_imgs
+def table_score(pred: str, gt: str) -> float:
+    pred_tables = re.findall(r'\|.*?\|', pred)
+    gt_tables = re.findall(r'\|.*?\|', gt)
 
-    # Мусор (длинные строки без пробелов)
-    long_lines_no_space = sum(1 for line in lines if len(line) > 150 and ' ' not in line)
-    stats["long_garbage_lines"] = long_lines_no_space
+    if not pred_tables or not gt_tables:
+        return 0.0
 
-    return stats
+    score = 0.0
+    for p, g in zip(pred_tables, gt_tables):
+        score += text_score(p, g)
+
+    return score / max(len(gt_tables), 1)
+
+
+def image_score(pred: str, gt: str) -> float:
+    pred_imgs = re.findall(r'!\[.*?\]\((.*?)\)', pred)
+    gt_imgs = re.findall(r'!\[.*?\]\((.*?)\)', gt)
+
+    if not pred_imgs or not gt_imgs:
+        return 0.0
+
+    return min(len(pred_imgs), len(gt_imgs)) / max(len(pred_imgs), len(gt_imgs))
+
+
+def structure_score(pred: str, gt: str) -> float:
+    pred_h = re.findall(r'^#+ .*', pred, re.MULTILINE)
+    gt_h = re.findall(r'^#+ .*', gt, re.MULTILINE)
+
+    if not pred_h and not gt_h:
+        return 1.0
+    if not pred_h or not gt_h:
+        return 0.0
+
+    return text_score("\n".join(pred_h), "\n".join(gt_h))
+
+
+def total_score(pred: str, gt: str) -> float:
+    return (
+        0.4 * table_score(pred, gt) +
+        0.3 * text_score(pred, gt) +
+        0.2 * structure_score(pred, gt) +
+        0.1 * image_score(pred, gt)
+    )
+
+
+def evaluate_all(pred_dir: Path, gt_dir: Path) -> None:
+    pred_files = sorted(pred_dir.glob("*.md"))
+    if not pred_files:
+        print("Нет .md файлов в директории предсказаний.")
+        return
+
+    total_scores = []
+    print(f"{'Файл':<20} {'Total':<8} {'Tables':<8} {'Text':<8} {'Struct':<8} {'Images':<8}")
+    print("-" * 65)
+
+    for pred_path in pred_files:
+        gt_path = gt_dir / pred_path.name
+        if not gt_path.exists():
+            print(f"{pred_path.name:<20} эталон не найден")
+            continue
+
+        pred_text = pred_path.read_text(encoding="utf-8")
+        gt_text = gt_path.read_text(encoding="utf-8")
+
+        t_score = table_score(pred_text, gt_text)
+        txt_score = text_score(pred_text, gt_text)
+        str_score = structure_score(pred_text, gt_text)
+        img_score = image_score(pred_text, gt_text)
+        total = total_score(pred_text, gt_text)
+
+        total_scores.append(total)
+
+        print(f"{pred_path.name:<20} {total:.4f}   {t_score:.4f}   {txt_score:.4f}   {str_score:.4f}   {img_score:.4f}")
+
+    if total_scores:
+        avg = sum(total_scores) / len(total_scores)
+        print("-" * 65)
+        print(f"{'СРЕДНЕЕ':<20} {avg:.4f}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Sanity Check")
-    parser.add_argument("--input-dir", type=Path, required=True)
-    parser.add_argument("--max-files", "-n", type=int, default=None, help="Количество файлов для проверки")
+    parser = argparse.ArgumentParser(description="Оценка метрик хакатона")
+    parser.add_argument("--pred-dir", type=Path, default=Path("results"), help="Папка с предсказаниями")
+    parser.add_argument("--gt-dir", type=Path, default=Path("dataset/public/ground_truth"), help="Папка с эталонами")
     args = parser.parse_args()
 
-    if not args.input_dir.is_dir():
-        print(f"Ошибка: Папка {args.input_dir} не найдена.")
-        return
+    evaluate_all(args.pred_dir, args.gt_dir)
 
-    md_files = sorted(args.input_dir.glob("*.md"))
-    if not md_files:
-        print("Нет .md файлов.")
-        return
-
-    if args.max_files is not None:
-        md_files = md_files[:args.max_files]
-        print(f"🔍 Анализ первых {len(md_files)} файлов...\n")
-    else:
-        print(f"🔍 Анализ всех {len(md_files)} файлов...\n")
-    
-    anomalies = []
-    total_miss = 0
-    total_imgs = 0
-
-    for md_path in md_files:
-        stats = analyze_md_file(md_path)
-        total_imgs += stats["images_linked"]
-        total_miss += stats["images_missing"]
-        
-        reasons = []
-        if stats["images_missing"] > 0:
-            reasons.append(f"🖼️ Потеряно {stats['images_missing']} картинок")
-        if stats["long_garbage_lines"] > 3:
-            reasons.append(f"🧟 {stats['long_garbage_lines']} строк-монстров")
-            
-        if reasons:
-            anomalies.append({"file": stats["filename"], "reasons": reasons})
-            
-        # Вывод статистики по каждому файлу (первые 10)
-        if md_files.index(md_path) < 10:
-             print(f"{stats['filename']:<25} | Карт: {stats['images_linked']} (Miss: {stats['images_missing']}) | Табл: {stats['tables_count']}")
-
-    print("\n" + "="*70)
-    print(f"Всего картинок: {total_imgs}, Потеряно: {total_miss}")
-    
-    if anomalies:
-        print(f"\n⚠️ Найдено {len(anomalies)} файлов с проблемами:")
-        for a in anomalies[:5]:
-            print(f"  - {a['file']}: {', '.join(a['reasons'])}")
-    else:
-        print("\n✅ Проблем не обнаружено.")
 
 if __name__ == "__main__":
     main()
