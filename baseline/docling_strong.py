@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
 Финальный конвертер PDF → Markdown на базе Docling с улучшенной обработкой таблиц.
-Использует TableFormer для распознавания таблиц и нашу функцию table_to_markdown
-для генерации корректного Markdown.
 """
 
 from __future__ import annotations
@@ -58,7 +56,7 @@ from docling_core.types.doc.base import ImageRefMode
 from docling_core.types.doc.document import TableItem
 
 # -----------------------------------------------------------------------------
-# Функции для таблиц (без изменений)
+# Функции для таблиц (базовые)
 # -----------------------------------------------------------------------------
 def clean_cell_text(value: Optional[str]) -> str:
     if value is None:
@@ -134,7 +132,7 @@ def table_to_markdown(rows: List[List[str]]) -> str:
     return "\n".join(lines)
 
 # -----------------------------------------------------------------------------
-# Работа с изображениями (УЛУЧШЕННАЯ ФИЛЬТРАЦИЯ ВОДЯНЫХ ЗНАКОВ)
+# Работа с изображениями (фильтрация водяных знаков)
 # -----------------------------------------------------------------------------
 _IMG_LINK_RE = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
 
@@ -167,9 +165,11 @@ def _move_or_convert_to_png(src: Path, dst: Path) -> None:
         shutil.move(str(src), str(dst))
 
 def _is_watermark_by_alt(alt_text: str) -> bool:
-    """Проверяет, содержит ли alt-текст ключевые слова водяных знаков."""
     alt_upper = alt_text.upper()
-    keywords = ["DRAFT", "ЧЕРНОВИК", "CONFIDENTIAL", "SAMPLE", "ОБРАЗЕЦ", "WATERMARK"]
+    keywords = [
+        "DRAFT", "ЧЕРНОВИК", "CONFIDENTIAL", "SAMPLE", "ОБРАЗЕЦ", "WATERMARK",
+        "КОНФИДЕНЦИАЛЬНО", "НЕ ДЛЯ РАСПРОСТРАНЕНИЯ"
+    ]
     return any(kw in alt_upper for kw in keywords)
 
 def _normalize_image_names(
@@ -179,46 +179,28 @@ def _normalize_image_names(
     doc_num: int,
 ) -> str:
     out_images_dir.mkdir(parents=True, exist_ok=True)
-    
-    MIN_IMAGE_SIZE = 15 * 1024  # 15 КБ – порог для фильтрации мусора
-    
-    # Сначала собираем все ссылки
+    MIN_IMAGE_SIZE = 15 * 1024
     matches = list(_IMG_LINK_RE.finditer(markdown))
     if not matches:
         return markdown
-    
     old_to_new = {}
     order = 1
-    
-    # Обрабатываем с конца, чтобы не сбить позиции при замене
     for match in reversed(matches):
         alt_text = match.group(1)
         old_path = match.group(2)
         full_match = match.group(0)
-        
         old_name = Path(old_path).name
         if not old_name:
             continue
-        
         src = work_images_dir / old_name
         if not src.is_file():
             src = work_images_dir / "images" / old_name
         if not src.is_file():
             continue
-        
-        # Фильтрация по размеру
         file_size = src.stat().st_size
-        if file_size < MIN_IMAGE_SIZE:
-            # Удаляем ссылку полностью
+        if file_size < MIN_IMAGE_SIZE or _is_watermark_by_alt(alt_text):
             markdown = markdown.replace(full_match, "")
             continue
-        
-        # Фильтрация по alt-тексту
-        if _is_watermark_by_alt(alt_text):
-            markdown = markdown.replace(full_match, "")
-            continue
-        
-        # Если файл прошёл фильтры – переименовываем
         if old_name in old_to_new:
             new_name = old_to_new[old_name]
         else:
@@ -226,11 +208,9 @@ def _normalize_image_names(
             old_to_new[old_name] = new_name
             _move_or_convert_to_png(src, out_images_dir / new_name)
             order += 1
-        
         new_path = f"images/{new_name}"
         new_link = f"![{alt_text}]({new_path})"
         markdown = markdown.replace(full_match, new_link)
-    
     return markdown
 
 def _build_converter(no_ocr: bool, no_table_structure: bool, full_quality: bool) -> DocumentConverter:
@@ -256,10 +236,9 @@ def _build_converter(no_ocr: bool, no_table_structure: bool, full_quality: bool)
     )
 
 # -----------------------------------------------------------------------------
-# Функция исправления границ слов в таблицах (НОВАЯ)
+# Улучшенная постобработка таблиц
 # -----------------------------------------------------------------------------
 def fix_word_boundaries_in_tables(text: str) -> str:
-    """Исправляет разорванные слова и слипшиеся слова в таблицах Markdown."""
     lines = text.split('\n')
     new_lines = []
     in_table = False
@@ -268,37 +247,164 @@ def fix_word_boundaries_in_tables(text: str) -> str:
         if stripped.startswith('|') and stripped.endswith('|'):
             in_table = True
             parts = stripped.split('|')
-            # Убираем пустые краевые элементы
             if parts and parts[0] == '':
                 parts.pop(0)
             if parts and parts[-1] == '':
                 parts.pop(-1)
             fixed_parts = []
             for cell in parts:
-                # Склейка разорванных цифр
                 cell = re.sub(r'(\d)\s+(\d)', r'\1\2', cell)
-                # Склейка коротких окончаний (2-3 буквы)
                 cell = re.sub(r'(\w)\s+([a-zа-яё]{1,3})(?=\W|$)', r'\1\2', cell, flags=re.IGNORECASE)
-                # Разделение слипшихся слов по регистру
                 cell = re.sub(r'([a-zа-яё])([A-ZА-ЯЁ])', r'\1 \2', cell)
-                # Убираем лишние пробелы
-                cell = re.sub(r'\s+', ' ', cell)
-                cell = cell.strip()
+                cell = re.sub(r'\s+', ' ', cell).strip()
                 fixed_parts.append(cell)
-            new_line = '| ' + ' | '.join(fixed_parts) + ' |'
-            new_lines.append(new_line)
+            new_lines.append('| ' + ' | '.join(fixed_parts) + ' |')
         else:
             if in_table and stripped == '':
                 in_table = False
-            # Обычный текст тоже слегка чистим (кроме заголовков)
             if not line.strip().startswith('#'):
                 line = re.sub(r'([a-zа-яё])([A-ZА-ЯЁ])', r'\1 \2', line)
                 line = re.sub(r'(\d)\s+(\d)', r'\1\2', line)
             new_lines.append(line)
     return '\n'.join(new_lines)
 
+def deduplicate_table_rows(text: str) -> str:
+    try:
+        from Levenshtein import ratio
+    except ImportError:
+        def ratio(a, b): return 1.0 if a == b else 0.0
+    lines = text.split('\n')
+    new_lines = []
+    in_table = False
+    prev_row = None
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith('|') and stripped.endswith('|'):
+            in_table = True
+            if '---' in stripped:
+                new_lines.append(line)
+                prev_row = None
+                continue
+            if prev_row is not None:
+                # Удаляем точные дубликаты или очень похожие (>90%)
+                if stripped == prev_row or ratio(stripped, prev_row) > 0.9:
+                    continue
+            # Пропускаем строки, состоящие только из пустых ячеек
+            cells = [c.strip() for c in stripped.split('|')[1:-1]]
+            if all(not c for c in cells):
+                continue
+            new_lines.append(line)
+            prev_row = stripped
+        else:
+            if in_table and stripped == '':
+                in_table = False
+                prev_row = None
+            new_lines.append(line)
+    return '\n'.join(new_lines)
+
+def merge_split_tables(text: str) -> str:
+    lines = text.split('\n')
+    new_lines = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if stripped.startswith('|') and stripped.endswith('|') and '---' not in stripped:
+            start = i
+            j = i
+            while j < len(lines) and lines[j].strip() != '':
+                j += 1
+            end = j
+            current = lines[start:end]
+            k = end + 1
+            while k < len(lines) and lines[k].strip() == '':
+                k += 1
+            if k < len(lines):
+                nxt = lines[k].strip()
+                if nxt.startswith('|') and nxt.endswith('|') and '---' not in nxt:
+                    m = k
+                    while m < len(lines) and lines[m].strip() != '':
+                        m += 1
+                    next_tbl = lines[k:m]
+                    # Сравниваем число столбцов
+                    sep_curr = next((ln for ln in current if '---' in ln), None)
+                    sep_next = next((ln for ln in next_tbl if '---' in ln), None)
+                    if sep_curr and sep_next:
+                        cols_curr = sep_curr.count('|') - 1
+                        cols_next = sep_next.count('|') - 1
+                        if cols_curr == cols_next:
+                            sep_idx = next((idx for idx, ln in enumerate(next_tbl) if '---' in ln), None)
+                            if sep_idx is not None:
+                                body = next_tbl[sep_idx+1:]
+                                new_lines.extend(current + body)
+                                i = m
+                                if m < len(lines) and lines[m].strip() == '':
+                                    new_lines.append(lines[m])
+                                    i = m + 1
+                                continue
+            new_lines.extend(current)
+            if end < len(lines):
+                new_lines.append(lines[end])
+            i = end + 1
+        else:
+            new_lines.append(line)
+            i += 1
+    return '\n'.join(new_lines)
+
+def normalize_table_columns(text: str) -> str:
+    lines = text.split('\n')
+    new_lines = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        stripped = line.strip()
+        if stripped.startswith('|') and stripped.endswith('|'):
+            table = []
+            while i < len(lines) and lines[i].strip() != '':
+                table.append(lines[i])
+                i += 1
+            # Определяем число столбцов по разделителю
+            sep = next((ln for ln in table if '---' in ln), None)
+            if sep:
+                expected = sep.count('|') - 1
+                fixed = []
+                for ln in table:
+                    if '---' in ln:
+                        fixed.append(ln)
+                        continue
+                    parts = ln.split('|')
+                    if parts and parts[0] == '': parts.pop(0)
+                    if parts and parts[-1] == '': parts.pop(-1)
+                    # Удаляем пустые столбцы справа, если их больше ожидаемого
+                    while len(parts) > expected and parts[-1].strip() == '':
+                        parts.pop()
+                    if len(parts) > expected:
+                        parts = parts[:expected]
+                    elif len(parts) < expected:
+                        parts.extend([''] * (expected - len(parts)))
+                    fixed.append('| ' + ' | '.join(p.strip() for p in parts) + ' |')
+                # Удаляем строки, где все ячейки пусты (кроме заголовка и разделителя)
+                filtered = []
+                for idx, ln in enumerate(fixed):
+                    if idx == 0 or '---' in ln:
+                        filtered.append(ln)
+                    else:
+                        cells = [c.strip() for c in ln.split('|')[1:-1]]
+                        if any(c for c in cells):
+                            filtered.append(ln)
+                new_lines.extend(filtered)
+            else:
+                new_lines.extend(table)
+            if i < len(lines) and lines[i].strip() == '':
+                new_lines.append(lines[i])
+                i += 1
+        else:
+            new_lines.append(line)
+            i += 1
+    return '\n'.join(new_lines)
+
 # -----------------------------------------------------------------------------
-# Основная конвертация (с удалением текстовых водяных знаков)
+# Основная конвертация
 # -----------------------------------------------------------------------------
 def convert_pdf(pdf_path: Path, output_dir: Path, converter: DocumentConverter) -> None:
     stem = pdf_path.stem
@@ -316,7 +422,7 @@ def convert_pdf(pdf_path: Path, output_dir: Path, converter: DocumentConverter) 
         )
         text = md_work.read_text(encoding="utf-8")
 
-        # Таблицы (пока без замены)
+        # Таблицы (замена не используется)
         tables: List[TableItem] = [item for item in doc.iterate_items() if isinstance(item, TableItem)]
         if tables:
             tables.sort(key=lambda t: (t.prov[0].page_no, t.prov[0].bbox[1] if t.prov else 0))
@@ -324,18 +430,8 @@ def convert_pdf(pdf_path: Path, output_dir: Path, converter: DocumentConverter) 
                 data = table.data.table_cells
                 if not data:
                     continue
-                # Генерация улучшенного Markdown (можно включить при необходимости)
-                # rows = []
-                # for row_idx in range(table.data.num_rows):
-                #     row = []
-                #     for col_idx in range(table.data.num_cols):
-                #         cell = data.get((row_idx, col_idx))
-                #         row.append(cell.text if cell else "")
-                #     rows.append(row)
-                # new_md = table_to_markdown(rows)
-                pass
 
-        # Нормализация имён изображений с фильтрацией водяных знаков
+        # Нормализация изображений
         text = _normalize_image_names(
             text,
             work_images_dir=work / "images",
@@ -343,36 +439,39 @@ def convert_pdf(pdf_path: Path, output_dir: Path, converter: DocumentConverter) 
             doc_num=doc_num,
         )
 
-        # Удаление текстовых водяных знаков
-        watermark_keywords = ["ЧЕРНОВИК", "DRAFT", "CONFIDENTIAL", "SAMPLE", "ОБРАЗЕЦ"]
+        # Удаление текстовых водяных знаков (агрессивно)
+        watermark_keywords = [
+            "ЧЕРНОВИК", "DRAFT", "CONFIDENTIAL", "SAMPLE", "ОБРАЗЕЦ",
+            "КОНФИДЕНЦИАЛЬНО", "НЕ ДЛЯ РАСПРОСТРАНЕНИЯ"
+        ]
         lines = text.split("\n")
         cleaned = []
         for line in lines:
-            if not line.strip():
-                cleaned.append(line)
-                continue
             upper_line = line.upper()
-            if any(keyword in upper_line for keyword in watermark_keywords):
+            if any(kw in upper_line for kw in watermark_keywords):
                 continue
             cleaned.append(line)
         text = "\n".join(cleaned)
 
         text = re.sub(r"\n{3,}", "\n\n", text)
         text = text.replace("\\", "/")
-        
-        # Исправление границ слов в таблицах (НОВЫЙ ШАГ)
+
+        # Применяем улучшенную постобработку таблиц
         text = fix_word_boundaries_in_tables(text)
+        text = deduplicate_table_rows(text)
+        text = merge_split_tables(text)
+        text = normalize_table_columns(text)
 
         out_md = output_dir / f"{stem}.md"
         out_md.write_text(text, encoding="utf-8")
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Docling final with improved tables")
+    parser = argparse.ArgumentParser(description="Docling final with aggressive cleaning")
     parser.add_argument("--input-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--max-files", type=int, default=None)
     parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
-    parser.add_argument("--full-quality", action="store_true", help="TableFormer ACCURATE mode")
+    parser.add_argument("--full-quality", action="store_true")
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)

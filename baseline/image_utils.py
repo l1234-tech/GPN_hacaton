@@ -12,6 +12,7 @@ from layout_utils import PageItem, overlaps
 
 MIN_IMAGE_SIDE = 80
 IMAGE_OVERLAP_THRESHOLD = 0.35
+MIN_IMAGE_SIZE_KB = 15  # минимальный размер файла в КБ
 
 
 def save_image_bytes(raw_bytes: bytes, output_path: Path) -> None:
@@ -59,6 +60,10 @@ def extract_page_images(
         if not raw_bytes:
             continue
 
+        # Фильтрация по размеру (водяные знаки обычно мелкие)
+        if len(raw_bytes) < MIN_IMAGE_SIZE_KB * 1024:
+            continue
+
         image_counter += 1
         filename = f"doc_{doc_id}_image_{image_counter}.png"
         save_image_bytes(raw_bytes, output_images_dir / filename)
@@ -80,9 +85,16 @@ def extract_page_images(
         if overlaps(bbox, image_bboxes, IMAGE_OVERLAP_THRESHOLD):
             continue
 
+        # Для drawing также проверяем размер после сохранения
         image_counter += 1
         filename = f"doc_{doc_id}_image_{image_counter}.png"
-        save_page_clip(page, bbox, output_images_dir / filename)
+        output_path = output_images_dir / filename
+        save_page_clip(page, bbox, output_path)
+        if output_path.stat().st_size < MIN_IMAGE_SIZE_KB * 1024:
+            output_path.unlink()
+            image_counter -= 1
+            continue
+
         image_bboxes.append(bbox)
         items.append(PageItem(kind="image", bbox=bbox, content=f"![Image](images/{filename})"))
 
