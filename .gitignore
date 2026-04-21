@@ -27,3 +27,4 @@ MANIFEST
 dataset/public/baseline_results/
 output/
 results/
+.env
