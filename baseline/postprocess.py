@@ -4,12 +4,23 @@ from __future__ import annotations
 import re
 
 
+def _maybe_join_broken(m: re.Match) -> str:
+    a, b = m.group(1), m.group(2)
+    # Keep space if second char is uppercase (likely separate word)
+    if b.isupper():
+        return m.group(0)
+    return a + b
+
+
 def clean_cell_text(value: str | None) -> str:
     if value is None:
         return ""
-    value = value.replace("\xa0", " ").replace("\n", " ")
-    value = re.sub(r"\s+", " ", value)
-    value = re.sub(r"\s+([,.;:!?%)\]])", r"\1", value)
+    value = value.replace("\xa0", " ")
+    value = re.sub(r"\s*\n\s*", " ", value)
+    value = re.sub(r"[ \t]+", " ", value)
+    # Fix broken words split across lines/columns: "есте ственный" → "естественный"
+    value = re.sub(r"([а-яёА-ЯЁa-zA-Z])\s([а-яёА-ЯЁa-zA-Z])", _maybe_join_broken, value)
+    value = re.sub(r"\s+([,.;:!?%°²³)\]])", r"\1", value)
     return value.strip()
 
 

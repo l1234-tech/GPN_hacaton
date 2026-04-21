@@ -1,180 +1,154 @@
+from __future__ import annotations
+
 import re
-from typing import List, Tuple, Optional, Dict, Any
+from dataclasses import dataclass
+from pathlib import Path
+from typing import List
+
 import pdfplumber
-from pdfplumber.table import TableFinder, TableSettings
 
-def is_valid_cell_text(text: str) -> bool:
-    """
-    Проверка, является ли текст ячейки валидным (не мусор и не артефакт).
-    Разрешены: кириллица, латиница, цифры, основные знаки препинания и спецсимволы (±, °, ≈, ₽, руб).
-    """
-    if not text or not text.strip():
-        return False
-    
-    text = text.strip()
-    
-    # Если текст очень короткий (1-2 символа), проверяем строже
-    if len(text) < 3:
-        # Разрешаем короткие слова, числа, даты, обозначения
-        if re.match(r'^[a-zA-Zа-яА-Я0-9°±≈]+$', text):
-            return True
-        # Если это просто знак препинания или мусорный символ - отклоняем
-        if re.match(r'^[^a-zA-Zа-яА-Я0-9]+$', text):
-            return False
 
-    # Подсчет "плохих" символов
-    bad_count = 0
-    total_count = len(text)
-    
-    for char in text:
-        code = ord(char)
-        # Разрешенные диапазоны:
-        # Базовая латиница (ASCII)
-        if 0x0020 <= code <= 0x007F:
-            continue
-        # Кириллица (основная и дополнительная)
-        if 0x0400 <= code <= 0x052F:
-            continue
-        # Латиница-1 Дополнение (диакритика)
-        if 0x00C0 <= code <= 0x00FF:
-            continue
-        # Специальные разрешенные символы
-        if char in '°²³₽$€£¥©®™±≈×÷¬¶§':
-            continue
-        # Основные знаки препинания
-        if char in '.,;:!?()[]{}\'"«»„"–—/\\|@#%&*+-=_<>':
-            continue
-            
-        # Все остальное считаем подозрительным
-        bad_count += 1
+@dataclass(frozen=True)
+class TableCandidate:
+    bbox: tuple[float, float, float, float]
+    markdown: str
 
-    # Порог мусора: если более 20% символов непонятные - считаем ячейку битой
-    # Исключение: очень короткие строки, где 1 символ уже много
-    if total_count > 0:
-        if bad_count / total_count > 0.20:
-            return False
-            
-    return True
 
-def clean_cell_text(text: str) -> str:
-    """
-    Очистка текста ячейки от артефактов переноса строк и лишних пробелов.
-    Сохраняет важные спецсимволы.
-    """
-    if not text:
+def _clean_cell(text: str | None) -> str:
+    if text is None:
         return ""
-    
-    # Замена переносов строк внутри ячейки на пробел (если это не список)
-    text = re.sub(r'\s*\n\s*', ' ', text)
-    
-    # Удаление множественных пробелов
-    text = re.sub(r'\s+', ' ', text)
-    
-    # Исправление частых артефактов OCR (если они есть), но аккуратно
-    # Например, замена '0' на 'О' в русском тексте часто ошибочна, оставляем как есть
-    
+    text = text.replace("\xa0", " ")
+    # Newlines inside cell → space
+    text = re.sub(r"\s*\n\s*", " ", text)
+    # Collapse multiple spaces
+    text = re.sub(r"[ \t]+", " ", text)
+    # Fix broken words: "естественны й" → "естественный"
+    # Pattern: letter immediately followed by space then letter where both are same script
+    text = re.sub(r"([а-яёА-ЯЁa-zA-Z])\s([а-яёА-ЯЁa-zA-Z])", _maybe_join_broken, text)
+    # Fix broken numbers: "3 987,88" — only if no other word context
+    text = re.sub(r"(\d)\s*,\s*(\d)", r"\1,\2", text)
+    text = re.sub(r"(\d)\s+(\d{3})\b", r"\1 \2", text)  # keep thousands separator spaces
+    # Fix space before punctuation
+    text = re.sub(r"\s+([,.;:!?%°²³])", r"\1", text)
     return text.strip()
 
-def extract_tables_from_page(page: pdfplumber.page.Page) -> List[Dict[str, Any]]:
-    """
-    Извлечение таблиц со страницы с использованием нескольких стратегий.
-    Возвращает список словарей с данными таблицы и её координатами.
-    """
-    tables_data = []
-    
-    # Стратегия 1: Стандартные таблицы с явными границами
-    # Используем настройки для лучшего обнаружения
-    settings = TableSettings(
-        vertical_strategy='lines',
-        horizontal_strategy='lines',
-        explicit_vertical_lines=None,
-        explicit_horizontal_lines=None,
-        snap_tolerance=3,
-        join_tolerance=3,
-        edge_min_length=3,
-        min_words_vertical=1, # Таблица может быть из 1 слова в столбце
-        min_words_horizontal=1,
-        intersection_tolerance=3
-    )
-    
-    try:
-        finder = TableFinder(page, settings)
-        for table in finder.tables:
-            rows = table.extract()
-            if not rows:
-                continue
-                
-            # Фильтрация и очистка данных
-            cleaned_rows = []
-            has_valid_data = False
-            
-            for row in rows:
-                cleaned_row = []
-                row_has_content = False
-                for cell in row:
-                    if is_valid_cell_text(cell):
-                        cleaned_cell = clean_cell_text(cell)
-                        cleaned_row.append(cleaned_cell)
-                        row_has_content = True
-                    else:
-                        cleaned_row.append("") # Пустая ячейка, но сохраняем структуру
-                
-                if row_has_content:
-                    cleaned_rows.append(cleaned_row)
-                    has_valid_data = True
-            
-            if has_valid_data and len(cleaned_rows) > 1: # Минимум заголовок + 1 строка
-                tables_data.append({
-                    'data': cleaned_rows,
-                    'bbox': table.bbox,
-                    'page': page.page_number
-                })
-    except Exception as e:
-        # Если стандартный метод упал, пробуем упрощенный
-        pass
 
-    # Стратегия 2: Поиск таблиц без явных границ (по выравниванию текста)
-    # Актуально, если стратегии 1 не хватило
-    if not tables_data:
-        try:
-            # Пробуем найти по тексту с группировкой
-            words = page.chars
-            if not words:
-                return tables_data
-                
-            # Эвристика: ищем группы слов, выровненных по сетке
-            # Это упрощенная реализация, можно расширить
-            pass 
-        except Exception:
-            pass
-            
-    return tables_data
+def _maybe_join_broken(m: re.Match) -> str:
+    """
+    Join two letters separated by a single space only when second letter is lowercase.
+    This catches PDF column-wrap artifacts like "естественны й" or "Multi-tie red".
+    Preserves "New York", "Q1 Result" etc. where second word starts with uppercase.
+    """
+    a, b = m.group(1), m.group(2)
+    # Keep the space if second char is uppercase (likely start of a new word)
+    if b.isupper():
+        return m.group(0)
+    return a + b
 
-def format_table_to_markdown(table_data: List[List[str]]) -> str:
+
+def _propagate_merged_cells(rows: list[list[str]]) -> list[list[str]]:
     """
-    Преобразование списка списков (таблицы) в Markdown формат.
+    pdfplumber returns None for cells that are part of a horizontal or vertical merge.
+    Propagate the last seen non-empty value rightward and downward to fill them.
+    This matches the hackathon requirement: split merged cells by copying content.
     """
-    if not table_data:
+    if not rows:
+        return rows
+
+    width = max(len(row) for row in rows)
+    # Pad all rows to same width
+    padded = [row + [None] * (width - len(row)) for row in rows]  # type: ignore[list-item]
+
+    # Horizontal propagation: fill None with previous non-None in same row
+    for row in padded:
+        last = ""
+        for j in range(width):
+            val = row[j]
+            if val is not None and val.strip():
+                last = val
+            elif val is None or not val.strip():
+                row[j] = last
+
+    # Vertical propagation: fill empty cells with value from row above
+    for j in range(width):
+        last = ""
+        for row in padded:
+            val = row[j]
+            if val and val.strip():
+                last = val
+            elif not val:
+                row[j] = last
+
+    return padded  # type: ignore[return-value]
+
+
+def _rows_to_markdown(rows: list[list[str]]) -> str:
+    if not rows:
         return ""
-    
-    md_lines = []
-    
-    # Заголовок
-    header = table_data[0]
-    md_lines.append("| " + " | ".join(header) + " |")
-    
-    # Разделитель
-    md_lines.append("| " + " | ".join(["---"] * len(header)) + " |")
-    
-    # Тело таблицы
-    for row in table_data[1:]:
-        # Выравниваем длину строки с заголовком
-        while len(row) < len(header):
-            row.append("")
-        row = row[:len(header)]
-        
-        # Экранирование вертикальных черт внутри ячеек
-        cleaned_row = [cell.replace("|", "\\|") for cell in row]
-        md_lines.append("| " + " | ".join(cleaned_row) + " |")
-    
-    return "\n".join(md_lines)
+
+    # Remove fully empty rows
+    rows = [r for r in rows if any(c.strip() for c in r)]
+    if not rows:
+        return ""
+
+    width = max(len(r) for r in rows)
+    # Normalize row widths
+    rows = [r + [""] * (width - len(r)) for r in rows]
+
+    # Escape pipe chars inside cells
+    def fmt(cell: str) -> str:
+        return cell.replace("|", "\\|")
+
+    header = rows[0]
+    body = rows[1:]
+
+    lines = [
+        "| " + " | ".join(fmt(c) for c in header) + " |",
+        "| " + " | ".join("---" for _ in header) + " |",
+    ]
+    for row in body:
+        lines.append("| " + " | ".join(fmt(c) for c in row) + " |")
+    return "\n".join(lines)
+
+
+def extract_tables(pdf_path: Path, page_number: int) -> List[TableCandidate]:
+    """
+    Extract tables from a PDF page using pdfplumber.
+    Returns list of TableCandidate with bbox and markdown string.
+    """
+    candidates: List[TableCandidate] = []
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            if page_number >= len(pdf.pages):
+                return candidates
+            page = pdf.pages[page_number]
+            tables = page.find_tables()
+            for tbl in tables:
+                try:
+                    raw_rows = tbl.extract()
+                    if not raw_rows or len(raw_rows) < 2:
+                        continue
+
+                    # Propagate merged cells (None → copied content)
+                    propagated = _propagate_merged_cells(raw_rows)
+
+                    # Clean each cell
+                    cleaned = [[_clean_cell(cell) for cell in row] for row in propagated]
+
+                    # Skip tables where almost all cells are empty
+                    total = sum(len(r) for r in cleaned)
+                    filled = sum(1 for r in cleaned for c in r if c.strip())
+                    if total > 0 and filled / total < 0.1:
+                        continue
+
+                    md = _rows_to_markdown(cleaned)
+                    if not md:
+                        continue
+
+                    bbox = tbl.bbox
+                    candidates.append(TableCandidate(bbox=bbox, markdown=md))
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return candidates
