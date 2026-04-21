@@ -1,101 +1,67 @@
-# baseline/image_utils.py
-from __future__ import annotations
-
-import io
-from pathlib import Path
-
-import fitz
+import os
+import fitz  # PyMuPDF
 from PIL import Image
+import io
+from typing import List, Tuple, Dict, Any
 
-from layout_utils import PageItem, overlaps
-
-
-MIN_IMAGE_SIDE = 80
-IMAGE_OVERLAP_THRESHOLD = 0.35
-MIN_IMAGE_SIZE_KB = 15  # минимальный размер файла в КБ
-
-
-def save_image_bytes(raw_bytes: bytes, output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    with Image.open(io.BytesIO(raw_bytes)) as image:
-        image.convert("RGB").save(output_path, format="PNG")
-
-
-def save_page_clip(page: fitz.Page, bbox: tuple[float, float, float, float], output_path: Path) -> None:
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=fitz.Rect(bbox), alpha=False).save(output_path)
-
-
-def extract_page_images(
-    page: fitz.Page,
-    table_bboxes: list[tuple[float, float, float, float]],
-    output_images_dir: Path,
-    doc_id: int,
-    image_counter_start: int,
-    skip_large_background: bool,
-) -> tuple[list[PageItem], int, list[tuple[float, float, float, float]]]:
-    items: list[PageItem] = []
-    image_bboxes: list[tuple[float, float, float, float]] = []
-    image_counter = image_counter_start
-    page_area = page.rect.width * page.rect.height
-    page_dict = page.get_text("dict")
-
-    for block in page_dict.get("blocks", []):
-        if block.get("type") != 1:
+def extract_images_from_page(page: fitz.Page, doc_index: int, output_images_dir: str) -> List[Dict[str, Any]]:
+    """
+    Извлечение изображений из страницы PDF.
+    Возвращает список метаданных о сохраненных изображениях.
+    """
+    saved_images = []
+    image_list = page.get_images(full=True)
+    
+    img_counter = 1
+    
+    for img_index, img_info in enumerate(image_list):
+        xref = img_info[0]
+        
+        try:
+            base_image = page.parent.extract_image(xref)
+            if not base_image:
+                continue
+                
+            image_bytes = base_image["image"]
+            image_ext = base_image["ext"]
+            
+            # Конвертация в PNG для унификации
+            img = Image.open(io.BytesIO(image_bytes))
+            
+            # Фильтр по размеру (игнорируем иконки и шум)
+            if img.width < 50 or img.height < 50:
+                continue
+                
+            # Формирование имени файла: doc_<N>_image_<K>.png
+            # N - номер документа (1-based), K - порядковый номер картинки в документе
+            filename = f"doc_{doc_index}_image_{img_counter}.png"
+            filepath = os.path.join(output_images_dir, filename)
+            
+            # Сохранение
+            if img.mode in ('RGBA', 'LA', 'P'):
+                img = img.convert('RGB')
+            img.save(filepath, "PNG")
+            
+            saved_images.append({
+                'filename': filename,
+                'path': filepath,
+                'bbox': None, # Можно добавить поиск координат, если нужно для позиционирования
+                'caption': f"Рис. {img_counter}" # Базовая подпись
+            })
+            
+            img_counter += 1
+            
+        except Exception as e:
+            print(f"Ошибка при извлечении изображения {xref}: {e}")
             continue
+            
+    return saved_images
 
-        bbox = tuple(block["bbox"])
-        x0, y0, x1, y1 = bbox
-        area_ratio = ((x1 - x0) * (y1 - y0)) / max(page_area, 1.0)
-        if (x1 - x0) < MIN_IMAGE_SIDE or (y1 - y0) < MIN_IMAGE_SIDE:
-            continue
-        if area_ratio > 0.45:
-            continue
-        if skip_large_background and area_ratio > 0.25:
-            continue
-        if overlaps(bbox, table_bboxes, IMAGE_OVERLAP_THRESHOLD):
-            continue
-
-        raw_bytes = block.get("image")
-        if not raw_bytes:
-            continue
-
-        # Фильтрация по размеру (водяные знаки обычно мелкие)
-        if len(raw_bytes) < MIN_IMAGE_SIZE_KB * 1024:
-            continue
-
-        image_counter += 1
-        filename = f"doc_{doc_id}_image_{image_counter}.png"
-        save_image_bytes(raw_bytes, output_images_dir / filename)
-        image_bboxes.append(bbox)
-        items.append(PageItem(kind="image", bbox=bbox, content=f"![Image](images/{filename})"))
-
-    for drawing_rect in page.cluster_drawings():
-        bbox = tuple(drawing_rect)
-        x0, y0, x1, y1 = bbox
-        area_ratio = ((x1 - x0) * (y1 - y0)) / max(page_area, 1.0)
-        if (x1 - x0) < 120 or (y1 - y0) < 120:
-            continue
-        if area_ratio > 0.45:
-            continue
-        if skip_large_background and area_ratio > 0.25:
-            continue
-        if overlaps(bbox, table_bboxes, IMAGE_OVERLAP_THRESHOLD):
-            continue
-        if overlaps(bbox, image_bboxes, IMAGE_OVERLAP_THRESHOLD):
-            continue
-
-        # Для drawing также проверяем размер после сохранения
-        image_counter += 1
-        filename = f"doc_{doc_id}_image_{image_counter}.png"
-        output_path = output_images_dir / filename
-        save_page_clip(page, bbox, output_path)
-        if output_path.stat().st_size < MIN_IMAGE_SIZE_KB * 1024:
-            output_path.unlink()
-            image_counter -= 1
-            continue
-
-        image_bboxes.append(bbox)
-        items.append(PageItem(kind="image", bbox=bbox, content=f"![Image](images/{filename})"))
-
-    return items, image_counter, image_bboxes
+def render_vector_graphics(page: fitz.Page, doc_index: int, output_images_dir: str, existing_images_count: int) -> List[Dict[str, Any]]:
+    """
+    Рендеринг векторной графики (диаграмм, графиков), которая не извлекается как растр.
+    Делает снимок области страницы, если там есть сложные объекты.
+    В данной базовой версии пропускаем, чтобы не дублировать, 
+    так как get_images обычно захватывает и встроенные растры графиков.
+    """
+    return []

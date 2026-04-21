@@ -1,498 +1,464 @@
-#!/usr/bin/env python3
-"""
-Финальный конвертер PDF → Markdown на базе Docling с улучшенной обработкой таблиц.
-"""
-
-from __future__ import annotations
-
-import argparse
-import gc
 import os
-import re
-import shutil
 import sys
-import tempfile
-from pathlib import Path
-from typing import List, Optional
+import argparse
+import re
+import hashlib
+from typing import List, Dict, Any, Optional, Tuple, Set
 
-os.environ.setdefault("GRPC_VERBOSITY", "ERROR")
-os.environ.setdefault("GLOG_minloglevel", "2")
-os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
+# Проверка зависимостей
+try:
+    import pdfplumber
+    import fitz  # PyMuPDF
+    from PIL import Image
+    import io
+except ImportError as e:
+    print(f"Ошибка импорта: {e}")
+    print("Установите зависимости: pip install pdfplumber pymupdf pillow")
+    sys.exit(1)
 
-def _apply_device_from_argv() -> None:
-    for i, arg in enumerate(sys.argv):
-        if arg == "--device" and i + 1 < len(sys.argv):
-            val = sys.argv[i + 1]
-            if val != "auto":
-                os.environ["DOCLING_DEVICE"] = val
-            return
-        if arg.startswith("--device="):
-            val = arg.split("=", 1)[1]
-            if val != "auto":
-                os.environ["DOCLING_DEVICE"] = val
-            return
+# ==========================================
+# КОНФИГУРАЦИЯ
+# ==========================================
+MIN_TABLE_ROWS = 2
+IMAGE_MIN_SIZE = 50
+WATERMARK_KEYWORDS = [
+    "confidential", "draft", "секретно", "образец", 
+    "page", "страница", "of", "из", "www.", "http://"
+]
 
-_apply_device_from_argv()
+# ==========================================
+# УТИЛИТЫ ДЛЯ ТЕКСТА (PRO FEATURES)
+# ==========================================
 
-def _patch_cv2_set_num_threads() -> None:
-    try:
-        import cv2
-    except ImportError:
-        return
-    if not hasattr(cv2, "setNumThreads"):
-        cv2.setNumThreads = lambda _nthreads: None
+def is_watermark_or_garbage(text: str) -> bool:
+    if not text or not text.strip():
+        return True
+    t = text.strip().lower()
+    
+    # Ключевые слова
+    for kw in WATERMARK_KEYWORDS:
+        if kw in t and len(t) < 60:
+            return True
+            
+    # Мусорные строки (только символы)
+    if re.match(r'^[\s\-_=.*]+$', t):
+        return True
+        
+    # Вертикальный мусор (набор одиночных букв через пробел)
+    # Пример: "Я И Н Е Н А" -> удаляем
+    words = t.split()
+    if len(words) > 3 and all(len(w) == 1 and w.isalpha() for w in words):
+        return True
+        
+    # Повторяющийся текст
+    if len(words) > 3:
+        unique_words = set(words)
+        if len(unique_words) == 1 and len(words) > 4:
+            return True
+            
+    return False
 
-_patch_cv2_set_num_threads()
+def fix_broken_words(text: str) -> str:
+    """
+    Исправляет разорванные слова внутри ячеек.
+    Пример: "естественны й" -> "естественный", "3987, 88" -> "3987,88"
+    """
+    if not text:
+        return text
+    
+    # 1. Склейка букв, разделенных пробелом, если это похоже на разорванное слово
+    # Паттерн: буква + пробел + буква (кириллица или латиница)
+    # Осторожно, чтобы не склеить разные слова. 
+    # Эвристика: если между буквами только один пробел и длина получившегося слова разумна
+    
+    # Простой вариант: убираем пробелы внутри чисел с запятой (3987, 88 -> 3987,88)
+    text = re.sub(r'(\d)\s*,\s*(\d)', r'\1,\2', text)
+    text = re.sub(r'(\d)\s*\.\s*(\d)', r'\1.\2', text)
+    
+    # Убираем пробелы перед "руб.", "°", "±"
+    text = re.sub(r'\s+(руб\.|°|±|%|USD|EUR)', r'\1', text)
+    
+    return text
 
-from docling.datamodel.accelerator_options import AcceleratorOptions
-from docling.datamodel.base_models import InputFormat
-from docling.datamodel.pipeline_options import (
-    TableFormerMode,
-    TableStructureOptions,
-    PdfPipelineOptions,
-)
-from docling.document_converter import DocumentConverter, PdfFormatOption
-from docling_core.types.doc.base import ImageRefMode
-from docling_core.types.doc.document import TableItem
-
-# -----------------------------------------------------------------------------
-# Функции для таблиц (базовые)
-# -----------------------------------------------------------------------------
-def clean_cell_text(value: Optional[str]) -> str:
-    if value is None:
+def clean_cell_content(cell_text: str) -> str:
+    if not cell_text:
         return ""
-    value = value.replace("\xa0", " ").replace("\n", " ")
-    value = re.sub(r"\s+", " ", value)
-    value = re.sub(r"\s+([,.;:!?%)\]])", r"\1", value)
-    return value.strip()
+    
+    # Базовая очистка
+    text = re.sub(r'\n', ' ', cell_text)
+    text = re.sub(r'\s+', ' ', text)
+    
+    # Применение умных фиксов
+    text = fix_broken_words(text)
+    
+    return text.strip()
 
-def fill_merged_header_cells(rows: List[List[str]]) -> List[List[str]]:
+def get_table_hash(rows: List[List[str]]) -> str:
     if not rows:
-        return rows
-    width = max(len(row) for row in rows)
-    normalized = [row + [""] * (width - len(row)) for row in rows]
-    for row in normalized:
-        last_seen = ""
-        for idx in range(len(row)):
-            if row[idx]:
-                last_seen = row[idx]
-            elif last_seen:
-                row[idx] = last_seen
-    for col in range(width):
-        last_seen = ""
-        for row in normalized:
-            if row[col]:
-                last_seen = row[col]
-            elif last_seen:
-                row[col] = last_seen
-    return normalized
-
-def infer_header_rows(rows: List[List[str]]) -> int:
-    if len(rows) <= 1:
-        return 1
-    header_rows = 1
-    for row in rows[:3]:
-        filled = [cell for cell in row if cell]
-        if not filled:
-            break
-        numeric_ratio = sum(bool(re.search(r"\d", cell)) for cell in filled) / max(1, len(filled))
-        if numeric_ratio <= 0.45:
-            header_rows += 1
-        else:
-            break
-    return min(header_rows, max(1, len(rows) - 1))
-
-def table_to_markdown(rows: List[List[str]]) -> str:
-    cleaned = [[clean_cell_text(cell) for cell in row] for row in rows]
-    cleaned = [row for row in cleaned if any(cell for cell in row)]
-    if not cleaned:
         return ""
-    width = max(len(row) for row in cleaned)
-    cleaned = [row + [""] * (width - len(row)) for row in cleaned]
-    header_rows = infer_header_rows(cleaned)
-    if header_rows >= len(cleaned):
-        header_rows = max(1, len(cleaned) - 1)
-    header = fill_merged_header_cells(cleaned[:header_rows])
-    body = cleaned[header_rows:]
-    header_line = []
-    for col in range(width):
-        parts = []
-        for row in header:
-            if row[col]:
-                parts.append(row[col])
-        header_line.append("_".join(parts) if parts else f"col_{col+1}")
-    separator = ["---"] * width
-    lines = [
-        "| " + " | ".join(header_line) + " |",
-        "| " + " | ".join(separator) + " |",
-    ]
-    for row in body:
-        formatted_row = [cell if cell else " " for cell in row]
-        lines.append("| " + " | ".join(formatted_row) + " |")
+    sample = rows[:3]
+    normalized = []
+    for row in sample:
+        norm_row = "|".join([str(cell).strip().lower() for cell in row])
+        normalized.append(norm_row)
+    content = ":::".join(normalized)
+    return hashlib.md5(content.encode('utf-8')).hexdigest()
+
+# ==========================================
+# ОБРАБОТКА ТАБЛИЦ
+# ==========================================
+
+def extract_tables_with_pdfplumber(page: pdfplumber.page.Page) -> List[Dict[str, Any]]:
+    tables = []
+    
+    # Используем стандартный extract_tables(), который стабилен во всех версиях
+    # Он автоматически определяет сетку
+    raw_tables = page.extract_tables()
+    
+    if not raw_tables:
+        return tables
+
+    for t_idx, table_rows in enumerate(raw_tables):
+        if not table_rows or len(table_rows) < MIN_TABLE_ROWS:
+            continue
+        
+        # Получаем bounding box таблицы (примерно)
+        # В старой версии api нет прямого bbox у extract_tables, но можно вычислить по словам
+        # Для простоты берем всю ширину страницы и высоту, занятую таблицей (эвристика)
+        # Или пробуем найти координаты через объекты, если нужно точно.
+        # Здесь используем заглушку bbox, так как для логики склейки важнее данные.
+        bbox = (0, page.height * 0.1, page.width, page.height * 0.9) 
+
+        cleaned_rows = []
+        for row in table_rows:
+            cleaned_row = []
+            row_has_content = False
+            for cell in row:
+                c_text = clean_cell_content(cell) if cell else ""
+                
+                # Фильтрация мусора
+                if is_watermark_or_garbage(c_text):
+                    cleaned_row.append("") 
+                else:
+                    cleaned_row.append(c_text)
+                    row_has_content = True
+            
+            if row_has_content:
+                cleaned_rows.append(cleaned_row)
+        
+        if len(cleaned_rows) >= MIN_TABLE_ROWS:
+            tables.append({
+                'data': cleaned_rows,
+                'bbox': bbox,
+                'page_num': page.page_number,
+                'height': page.height,
+                'top_text': None # Будет заполнено позже
+            })
+            
+    return tables
+
+def find_context_title(page: pdfplumber.page.Page, table_bbox: Tuple[float, float, float, float]) -> Optional[str]:
+    """
+    Пытается найти заголовок таблицы, анализируя текст над ней.
+    """
+    if not table_bbox:
+        return None
+        
+    top = table_bbox[1]
+    # Берем область над таблицей (50-100 пикселей)
+    search_box = (table_bbox[0], max(0, top - 100), table_bbox[2], top)
+    
+    # Извлекаем текст из этой области
+    # В pdfplumber можно crop страницу
+    try:
+        crop_page = page.crop(search_box)
+        text = crop_page.extract_text()
+        if text:
+            lines = [l.strip() for l in text.split('\n') if l.strip()]
+            if lines:
+                # Берем последнюю непустую строку перед таблицей
+                candidate = lines[-1]
+                if not is_watermark_or_garbage(candidate) and len(candidate) < 150:
+                    return candidate
+    except Exception:
+        pass
+    return None
+
+def merge_split_tables(all_tables: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not all_tables:
+        return []
+    
+    merged_tables = []
+    # Сортировка
+    all_tables.sort(key=lambda x: (x['page_num'], x['bbox'][1]))
+    
+    current_table = None
+    
+    for i, table in enumerate(all_tables):
+        if current_table is None:
+            current_table = table
+            continue
+        
+        prev = current_table
+        curr = table
+        
+        can_merge = False
+        curr_body = []
+        
+        # Проверка количества столбцов
+        if len(prev['data'][0]) == len(curr['data'][0]):
+            prev_header = prev['data'][0]
+            curr_first_row = curr['data'][0]
+            
+            # Дубликат заголовка?
+            if prev_header == curr_first_row:
+                can_merge = True
+                curr_body = curr['data'][1:]
+            else:
+                # Просто продолжение? Проверяем схожесть стилей или просто склеиваем, если близко по смыслу
+                # Для надежности склеиваем, если структура совпадает
+                can_merge = True
+                curr_body = curr['data']
+        
+        if can_merge:
+            # Проверка на полный дубликат
+            if get_table_hash(prev['data']) == get_table_hash(curr['data']) and len(prev['data']) == len(curr['data']):
+                continue
+            
+            new_data = prev['data'][:]
+            if curr_body:
+                new_data.extend(curr_body)
+            
+            current_table = {
+                'data': new_data,
+                'bbox': prev['bbox'],
+                'page_num': prev['page_num'],
+                'height': prev['height'],
+                'merged_pages': list(set(prev.get('merged_pages', [prev['page_num']]) + [curr['page_num']])),
+                'title': prev.get('title') # Сохраняем титул
+            }
+        else:
+            merged_tables.append(current_table)
+            current_table = table
+            
+    if current_table:
+        merged_tables.append(current_table)
+        
+    return merged_tables
+
+def format_table_to_markdown(table_data: List[List[str]], title: Optional[str] = None) -> str:
+    if not table_data:
+        return ""
+    
+    lines = []
+    
+    if title:
+        lines.append(f"### {title}")
+        lines.append("")
+    
+    num_cols = len(table_data[0])
+    
+    header = [cell.replace("|", "\\|") for cell in table_data[0]]
+    lines.append("| " + " | ".join(header) + " |")
+    lines.append("| " + " | ".join(["---"] * num_cols) + " |")
+    
+    for row in table_data[1:]:
+        while len(row) < num_cols:
+            row.append("")
+        row = row[:num_cols]
+        clean_row = [cell.replace("|", "\\|") for cell in row]
+        lines.append("| " + " | ".join(clean_row) + " |")
+    
     return "\n".join(lines)
 
-# -----------------------------------------------------------------------------
-# Работа с изображениями (фильтрация водяных знаков)
-# -----------------------------------------------------------------------------
-_IMG_LINK_RE = re.compile(r'!\[([^\]]*)\]\(([^)]+)\)')
+# ==========================================
+# ОБРАБОТКА ИЗОБРАЖЕНИЙ
+# ==========================================
 
-def _clear_cuda_cache() -> None:
-    try:
-        import torch
-    except ImportError:
-        return
-    if torch.cuda.is_available():
-        gc.collect()
-        torch.cuda.empty_cache()
-
-def _doc_num_from_stem(stem: str) -> int:
-    parts = stem.rsplit("_", 1)
-    if len(parts) != 2:
-        return 1
-    try:
-        return int(parts[1])
-    except ValueError:
-        return 1
-
-def _move_or_convert_to_png(src: Path, dst: Path) -> None:
-    ext = src.suffix.lower()
-    if ext in (".jpg", ".jpeg"):
-        from PIL import Image
-        with Image.open(src) as im:
-            im.save(dst, format="PNG")
-        src.unlink()
-    else:
-        shutil.move(str(src), str(dst))
-
-def _is_watermark_by_alt(alt_text: str) -> bool:
-    alt_upper = alt_text.upper()
-    keywords = [
-        "DRAFT", "ЧЕРНОВИК", "CONFIDENTIAL", "SAMPLE", "ОБРАЗЕЦ", "WATERMARK",
-        "КОНФИДЕНЦИАЛЬНО", "НЕ ДЛЯ РАСПРОСТРАНЕНИЯ"
-    ]
-    return any(kw in alt_upper for kw in keywords)
-
-def _normalize_image_names(
-    markdown: str,
-    work_images_dir: Path,
-    out_images_dir: Path,
-    doc_num: int,
-) -> str:
-    out_images_dir.mkdir(parents=True, exist_ok=True)
-    MIN_IMAGE_SIZE = 15 * 1024
-    matches = list(_IMG_LINK_RE.finditer(markdown))
-    if not matches:
-        return markdown
-    old_to_new = {}
-    order = 1
-    for match in reversed(matches):
-        alt_text = match.group(1)
-        old_path = match.group(2)
-        full_match = match.group(0)
-        old_name = Path(old_path).name
-        if not old_name:
-            continue
-        src = work_images_dir / old_name
-        if not src.is_file():
-            src = work_images_dir / "images" / old_name
-        if not src.is_file():
-            continue
-        file_size = src.stat().st_size
-        if file_size < MIN_IMAGE_SIZE or _is_watermark_by_alt(alt_text):
-            markdown = markdown.replace(full_match, "")
-            continue
-        if old_name in old_to_new:
-            new_name = old_to_new[old_name]
-        else:
-            new_name = f"doc_{doc_num}_image_{order}.png"
-            old_to_new[old_name] = new_name
-            _move_or_convert_to_png(src, out_images_dir / new_name)
-            order += 1
-        new_path = f"images/{new_name}"
-        new_link = f"![{alt_text}]({new_path})"
-        markdown = markdown.replace(full_match, new_link)
-    return markdown
-
-def _build_converter(no_ocr: bool, no_table_structure: bool, full_quality: bool) -> DocumentConverter:
-    if full_quality:
-        images_scale = 1.0
-        table_opts = TableStructureOptions(mode=TableFormerMode.ACCURATE)
-    else:
-        images_scale = 0.88
-        table_opts = TableStructureOptions(mode=TableFormerMode.FAST)
-    pipeline_options = PdfPipelineOptions(
-        do_ocr=not no_ocr,
-        do_table_structure=not no_table_structure,
-        generate_picture_images=True,
-        images_scale=images_scale,
-        table_structure_options=table_opts,
-        accelerator_options=AcceleratorOptions(),
-    )
-    return DocumentConverter(
-        allowed_formats=[InputFormat.PDF],
-        format_options={
-            InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options),
-        },
-    )
-
-# -----------------------------------------------------------------------------
-# Улучшенная постобработка таблиц
-# -----------------------------------------------------------------------------
-def fix_word_boundaries_in_tables(text: str) -> str:
-    lines = text.split('\n')
-    new_lines = []
-    in_table = False
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith('|') and stripped.endswith('|'):
-            in_table = True
-            parts = stripped.split('|')
-            if parts and parts[0] == '':
-                parts.pop(0)
-            if parts and parts[-1] == '':
-                parts.pop(-1)
-            fixed_parts = []
-            for cell in parts:
-                cell = re.sub(r'(\d)\s+(\d)', r'\1\2', cell)
-                cell = re.sub(r'(\w)\s+([a-zа-яё]{1,3})(?=\W|$)', r'\1\2', cell, flags=re.IGNORECASE)
-                cell = re.sub(r'([a-zа-яё])([A-ZА-ЯЁ])', r'\1 \2', cell)
-                cell = re.sub(r'\s+', ' ', cell).strip()
-                fixed_parts.append(cell)
-            new_lines.append('| ' + ' | '.join(fixed_parts) + ' |')
-        else:
-            if in_table and stripped == '':
-                in_table = False
-            if not line.strip().startswith('#'):
-                line = re.sub(r'([a-zа-яё])([A-ZА-ЯЁ])', r'\1 \2', line)
-                line = re.sub(r'(\d)\s+(\d)', r'\1\2', line)
-            new_lines.append(line)
-    return '\n'.join(new_lines)
-
-def deduplicate_table_rows(text: str) -> str:
-    try:
-        from Levenshtein import ratio
-    except ImportError:
-        def ratio(a, b): return 1.0 if a == b else 0.0
-    lines = text.split('\n')
-    new_lines = []
-    in_table = False
-    prev_row = None
-    for line in lines:
-        stripped = line.strip()
-        if stripped.startswith('|') and stripped.endswith('|'):
-            in_table = True
-            if '---' in stripped:
-                new_lines.append(line)
-                prev_row = None
-                continue
-            if prev_row is not None:
-                # Удаляем точные дубликаты или очень похожие (>90%)
-                if stripped == prev_row or ratio(stripped, prev_row) > 0.9:
+def extract_images_from_doc(doc_path: str, doc_index: int, output_images_dir: str) -> List[Dict[str, Any]]:
+    saved_images = []
+    doc_fit = fitz.open(doc_path)
+    img_counter = 1
+    
+    for page_num, page in enumerate(doc_fit):
+        image_list = page.get_images(full=True)
+        
+        for img_info in image_list:
+            xref = img_info[0]
+            try:
+                base_image = page.parent.extract_image(xref)
+                if not base_image:
                     continue
-            # Пропускаем строки, состоящие только из пустых ячеек
-            cells = [c.strip() for c in stripped.split('|')[1:-1]]
-            if all(not c for c in cells):
-                continue
-            new_lines.append(line)
-            prev_row = stripped
-        else:
-            if in_table and stripped == '':
-                in_table = False
-                prev_row = None
-            new_lines.append(line)
-    return '\n'.join(new_lines)
-
-def merge_split_tables(text: str) -> str:
-    lines = text.split('\n')
-    new_lines = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-        if stripped.startswith('|') and stripped.endswith('|') and '---' not in stripped:
-            start = i
-            j = i
-            while j < len(lines) and lines[j].strip() != '':
-                j += 1
-            end = j
-            current = lines[start:end]
-            k = end + 1
-            while k < len(lines) and lines[k].strip() == '':
-                k += 1
-            if k < len(lines):
-                nxt = lines[k].strip()
-                if nxt.startswith('|') and nxt.endswith('|') and '---' not in nxt:
-                    m = k
-                    while m < len(lines) and lines[m].strip() != '':
-                        m += 1
-                    next_tbl = lines[k:m]
-                    # Сравниваем число столбцов
-                    sep_curr = next((ln for ln in current if '---' in ln), None)
-                    sep_next = next((ln for ln in next_tbl if '---' in ln), None)
-                    if sep_curr and sep_next:
-                        cols_curr = sep_curr.count('|') - 1
-                        cols_next = sep_next.count('|') - 1
-                        if cols_curr == cols_next:
-                            sep_idx = next((idx for idx, ln in enumerate(next_tbl) if '---' in ln), None)
-                            if sep_idx is not None:
-                                body = next_tbl[sep_idx+1:]
-                                new_lines.extend(current + body)
-                                i = m
-                                if m < len(lines) and lines[m].strip() == '':
-                                    new_lines.append(lines[m])
-                                    i = m + 1
-                                continue
-            new_lines.extend(current)
-            if end < len(lines):
-                new_lines.append(lines[end])
-            i = end + 1
-        else:
-            new_lines.append(line)
-            i += 1
-    return '\n'.join(new_lines)
-
-def normalize_table_columns(text: str) -> str:
-    lines = text.split('\n')
-    new_lines = []
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        stripped = line.strip()
-        if stripped.startswith('|') and stripped.endswith('|'):
-            table = []
-            while i < len(lines) and lines[i].strip() != '':
-                table.append(lines[i])
-                i += 1
-            # Определяем число столбцов по разделителю
-            sep = next((ln for ln in table if '---' in ln), None)
-            if sep:
-                expected = sep.count('|') - 1
-                fixed = []
-                for ln in table:
-                    if '---' in ln:
-                        fixed.append(ln)
-                        continue
-                    parts = ln.split('|')
-                    if parts and parts[0] == '': parts.pop(0)
-                    if parts and parts[-1] == '': parts.pop(-1)
-                    # Удаляем пустые столбцы справа, если их больше ожидаемого
-                    while len(parts) > expected and parts[-1].strip() == '':
-                        parts.pop()
-                    if len(parts) > expected:
-                        parts = parts[:expected]
-                    elif len(parts) < expected:
-                        parts.extend([''] * (expected - len(parts)))
-                    fixed.append('| ' + ' | '.join(p.strip() for p in parts) + ' |')
-                # Удаляем строки, где все ячейки пусты (кроме заголовка и разделителя)
-                filtered = []
-                for idx, ln in enumerate(fixed):
-                    if idx == 0 or '---' in ln:
-                        filtered.append(ln)
-                    else:
-                        cells = [c.strip() for c in ln.split('|')[1:-1]]
-                        if any(c for c in cells):
-                            filtered.append(ln)
-                new_lines.extend(filtered)
-            else:
-                new_lines.extend(table)
-            if i < len(lines) and lines[i].strip() == '':
-                new_lines.append(lines[i])
-                i += 1
-        else:
-            new_lines.append(line)
-            i += 1
-    return '\n'.join(new_lines)
-
-# -----------------------------------------------------------------------------
-# Основная конвертация
-# -----------------------------------------------------------------------------
-def convert_pdf(pdf_path: Path, output_dir: Path, converter: DocumentConverter) -> None:
-    stem = pdf_path.stem
-    doc_num = _doc_num_from_stem(stem)
-    result = converter.convert(str(pdf_path))
-    doc = result.document
-
-    with tempfile.TemporaryDirectory(prefix=f"docling_{stem}_") as tmp:
-        work = Path(tmp)
-        md_work = work / f"{stem}.md"
-        doc.save_as_markdown(
-            md_work,
-            artifacts_dir=Path("images"),
-            image_mode=ImageRefMode.REFERENCED,
-        )
-        text = md_work.read_text(encoding="utf-8")
-
-        # Таблицы (замена не используется)
-        tables: List[TableItem] = [item for item in doc.iterate_items() if isinstance(item, TableItem)]
-        if tables:
-            tables.sort(key=lambda t: (t.prov[0].page_no, t.prov[0].bbox[1] if t.prov else 0))
-            for table in tables:
-                data = table.data.table_cells
-                if not data:
+                
+                image_bytes = base_image["image"]
+                img_ext = base_image["ext"]
+                
+                img = Image.open(io.BytesIO(image_bytes))
+                
+                if img.width < IMAGE_MIN_SIZE or img.height < IMAGE_MIN_SIZE:
                     continue
-
-        # Нормализация изображений
-        text = _normalize_image_names(
-            text,
-            work_images_dir=work / "images",
-            out_images_dir=output_dir / "images",
-            doc_num=doc_num,
-        )
-
-        # Удаление текстовых водяных знаков (агрессивно)
-        watermark_keywords = [
-            "ЧЕРНОВИК", "DRAFT", "CONFIDENTIAL", "SAMPLE", "ОБРАЗЕЦ",
-            "КОНФИДЕНЦИАЛЬНО", "НЕ ДЛЯ РАСПРОСТРАНЕНИЯ"
-        ]
-        lines = text.split("\n")
-        cleaned = []
-        for line in lines:
-            upper_line = line.upper()
-            if any(kw in upper_line for kw in watermark_keywords):
+                
+                if img.mode in ('RGBA', 'LA', 'P'):
+                    img = img.convert('RGB')
+                
+                filename = f"doc_{doc_index}_image_{img_counter}.png"
+                filepath = os.path.join(output_images_dir, filename)
+                
+                img.save(filepath, "PNG")
+                
+                saved_images.append({
+                    'filename': filename,
+                    'path': filepath,
+                    'page': page_num + 1,
+                    'caption': f"Рис. {img_counter}"
+                })
+                
+                img_counter += 1
+                
+            except Exception as e:
                 continue
-            cleaned.append(line)
-        text = "\n".join(cleaned)
+                
+    doc_fit.close()
+    return saved_images
 
-        text = re.sub(r"\n{3,}", "\n\n", text)
-        text = text.replace("\\", "/")
+# ==========================================
+# ОСНОВНОЙ ПРОЦЕСС
+# ==========================================
 
-        # Применяем улучшенную постобработку таблиц
-        text = fix_word_boundaries_in_tables(text)
-        text = deduplicate_table_rows(text)
-        text = merge_split_tables(text)
-        text = normalize_table_columns(text)
+def process_document(pdf_path: str, doc_index: int, output_md_path: str, images_dir: str) -> bool:
+    stats = {"tables": 0, "images": 0, "pages": 0}
+    
+    # 1. Извлечение таблиц и текста
+    all_tables_raw = []
+    text_blocks = []
+    
+    with pdfplumber.open(pdf_path) as pdf:
+        stats["pages"] = len(pdf.pages)
+        for page in pdf.pages:
+            # Текст
+            p_text = page.extract_text()
+            if p_text:
+                text_blocks.append(p_text)
+            
+            # Таблицы
+            page_tables = extract_tables_with_pdfplumber(page)
+            
+            # Поиск заголовков для каждой таблицы
+            for tbl in page_tables:
+                title = find_context_title(page, tbl['bbox'])
+                tbl['title'] = title
+            
+            all_tables_raw.extend(page_tables)
+    
+    # Обработка таблиц
+    final_tables = merge_split_tables(all_tables_raw)
+    stats["tables"] = len(final_tables)
+    
+    # Изображения
+    images = extract_images_from_doc(pdf_path, doc_index, images_dir)
+    stats["images"] = len(images)
+    
+    # Генерация MD
+    md_lines = []
+    
+    # Заголовок документа
+    full_text = "\n".join(text_blocks)
+    first_lines = [l for l in full_text.split('\n') if l.strip() and not is_watermark_or_garbage(l)]
+    
+    if first_lines:
+        title = first_lines[0].strip()
+        if len(title) > 100:
+            title = " ".join(title.split()[:10]) + "..."
+        # Фильтр вертикального мусора в заголовке
+        words = title.split()
+        if len(words) > 3 and all(len(w) == 1 for w in words):
+            title = "Документ" # Если заголовок оказался мусором
+            
+        md_lines.append(f"# {title}")
+        md_lines.append("")
+        
+        intro = "\n".join(first_lines[1:5])
+        if intro:
+            md_lines.append(intro)
+            md_lines.append("")
+    
+    # Таблицы
+    if final_tables:
+        md_lines.append("## Сводные данные")
+        md_lines.append("")
+        
+        for table in final_tables:
+            md_table = format_table_to_markdown(table['data'], title=table.get('title'))
+            md_lines.append(md_table)
+            md_lines.append("")
+            
+    # Изображения
+    if images:
+        for img in images:
+            md_lines.append(f"![{img['caption']}](images/{img['filename']})")
+            md_lines.append(f"{img['caption']}")
+            md_lines.append("")
+            md_lines.append("----")
+            md_lines.append("")
+    
+    # Запись
+    try:
+        with open(output_md_path, 'w', encoding='utf-8') as f:
+            f.write("\n".join(md_lines))
+        return True, stats
+    except Exception as e:
+        print(f"Error saving: {e}")
+        return False, stats
 
-        out_md = output_dir / f"{stem}.md"
-        out_md.write_text(text, encoding="utf-8")
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Docling final with aggressive cleaning")
-    parser.add_argument("--input-dir", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
+def main():
+    parser = argparse.ArgumentParser(description="PDF to Markdown Converter PRO")
+    parser.add_argument("--input-dir", required=True)
+    parser.add_argument("--output-dir", required=True)
     parser.add_argument("--max-files", type=int, default=None)
-    parser.add_argument("--device", choices=("auto", "cpu", "cuda", "mps"), default="auto")
-    parser.add_argument("--full-quality", action="store_true")
     args = parser.parse_args()
-
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    pdf_files = sorted(args.input_dir.glob("*.pdf"))
+    
+    input_dir = args.input_dir
+    output_dir = args.output_dir
+    images_dir = os.path.join(output_dir, "images")
+    
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(images_dir, exist_ok=True)
+    
+    pdf_files = sorted([f for f in os.listdir(input_dir) if f.lower().endswith('.pdf')])
+    
     if args.max_files:
         pdf_files = pdf_files[:args.max_files]
-    if not pdf_files:
-        print("No PDF files found.")
-        return
-
-    converter = _build_converter(no_ocr=False, no_table_structure=False, full_quality=args.full_quality)
-    converter.initialize_pipeline(InputFormat.PDF)
-
-    for pdf_path in pdf_files:
-        try:
-            convert_pdf(pdf_path, args.output_dir, converter)
-            print(f"{pdf_path.name}: OK")
-        except Exception as e:
-            print(f"{pdf_path.name}: ERROR: {e}")
-        finally:
-            _clear_cuda_cache()
+        
+    print(f"Запуск PRO версии. Файлов: {len(pdf_files)}")
+    
+    total_stats = {"tables": 0, "images": 0, "pages": 0}
+    success_count = 0
+    
+    for idx, filename in enumerate(pdf_files):
+        doc_index = idx + 1
+        print(f"[{idx+1}/{len(pdf_files)}] {filename}...", end=" ")
+        
+        input_path = os.path.join(input_dir, filename)
+        output_filename = f"document_{doc_index:03d}.md"
+        output_path = os.path.join(output_dir, output_filename)
+        
+        success, stats = process_document(input_path, doc_index, output_path, images_dir)
+        
+        if success:
+            success_count += 1
+            total_stats['tables'] += stats['tables']
+            total_stats['images'] += stats['images']
+            total_stats['pages'] += stats['pages']
+            print(f"OK (Таблиц: {stats['tables']}, Картинки: {stats['images']})")
+        else:
+            print("FAIL")
+            
+    print("-" * 30)
+    print(f"Готово! Успешно: {success_count}/{len(pdf_files)}")
+    print(f"Всего обработано страниц: {total_stats['pages']}")
+    print(f"Всего извлечено таблиц: {total_stats['tables']}")
+    print(f"Всего сохранено изображений: {total_stats['images']}")
+    print(f"Результат в: {output_dir}")
 
 if __name__ == "__main__":
     main()
